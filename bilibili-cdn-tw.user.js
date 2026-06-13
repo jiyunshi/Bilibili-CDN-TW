@@ -1,10 +1,9 @@
 ﻿// ==UserScript==
-// Update test
 // @name         Bilibili CDN 台灣優化
 // @namespace    BiliCDN_TW
 // @version      1.2.2
 // @description  改善台灣網路觀看 Bilibili 影片時的 CDN 連線穩定度，支援自動切換與卡頓監測
-// @author       Mittag <chocosensei214@gmail.com>
+// @author       jiyunshi <chocosensei214@gmail.com>
 // @license      MIT
 // @icon         https://i0.hdslb.com/bfs/static/jinkela/long/images/512.png
 // @run-at       document-start

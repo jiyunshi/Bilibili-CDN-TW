@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/28915727/README.md)
 # Bilibili CDN 台灣優化
 
 <a name="zh-tw"></a>

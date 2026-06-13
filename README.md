@@ -7,7 +7,7 @@
 它會在播放影片時自動避開比較慢、容易斷線、黑畫面或卡頓的影片節點，並改用目前比較順的節點。
 
 版本：`1.2.2`  
-作者：`Mittag`  
+作者：`jiyunshi`  
 聯絡信箱：<span>chocosensei214</span><span>&#64;</span><span>gmail</span><span>&#46;</span><span>com</span>
 
 語言：[繁體中文](#zh-tw) | [English](#english)

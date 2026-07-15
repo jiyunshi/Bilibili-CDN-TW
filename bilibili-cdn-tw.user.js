@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         Bilibili CDN 台灣優化
 // @namespace    BiliCDN_TW
-// @version      1.2.2
+// @version      1.2.3
 // @description  改善台灣網路觀看 Bilibili 影片時的 CDN 連線穩定度，支援自動切換與卡頓監測
 // @author       jiyunshi <chocosensei214@gmail.com>
 // @license      MIT
@@ -23,7 +23,8 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        unsafeWindow
-// @downloadURL none
+// @downloadURL https://update.greasyfork.org/scripts/579776/Bilibili%20CDN%20%E5%8F%B0%E7%81%A3%E5%84%AA%E5%8C%96.user.js
+// @updateURL https://update.greasyfork.org/scripts/579776/Bilibili%20CDN%20%E5%8F%B0%E7%81%A3%E5%84%AA%E5%8C%96.meta.js
 // ==/UserScript==
 
 // ── 使用者設定 ────────────────────────────────────────────────────────
@@ -45,7 +46,7 @@ var PreferredVideoCodec = 'hevc'
 
 // ── 診斷輸出 ──────────────────────────────────────────────────────────
 // 預設不輸出背景 log；需要排查時可在 console 執行 BiliCDN.verbose(true)。
-const PluginName = 'BiliCDN_TW_v1.2.2'
+const PluginName = 'BiliCDN_TW_v1.2.3'
 const Config = { verbose: !!GM_getValue('verbose') }
 const log = (...args) => { if (Config.verbose) console.log('[' + PluginName + ']:', ...args) }
 const err = (...args) => { if (Config.verbose) console.error('[' + PluginName + ']:', ...args) }
@@ -147,7 +148,7 @@ const knownDeadHosts = (() => {
 // 升級/首次安裝：清掉舊黑名單+probe 快取，注入預設台灣死節點
 try {
     const installedVersion = GM_getValue('blicdnVersion')
-    if (installedVersion !== '1.2.2') {
+    if (installedVersion !== '1.2.3') {
         // 1.1.0+ 改用實測下載速度挑節點；舊 probe 快取是延遲排序，一律清掉重學
         GM_setValue('probeCache_v1', null)
         const stateSafeVersions = new Set(['1.0.0', '1.1.0', '1.2.0', '1.2.1', '1.2.2', '1.2.3', '1.2.4', '1.3.0', '1.4.0', '4.4.6', '4.5.0', '4.5.1', '4.6.1', '4.6.2', '4.6.3', '4.6.4', '4.6.7', '4.6.8', '4.6.9', '4.7.0'])
@@ -170,7 +171,7 @@ try {
                 } catch {}
             }
         }
-        GM_setValue('blicdnVersion', '1.2.2')
+        GM_setValue('blicdnVersion', '1.2.3')
     }
 } catch {}
 
@@ -600,8 +601,11 @@ const isBiliJsonMetadataApi = (url) => {
     try {
         const u = new URL(url, location.href)
         if (u.hostname !== 'api.bilibili.com') return false
+        // 注意：/x/v2/dm/web/view 官方回傳 Protobuf 二進位（高能進度條開關等資訊即在此包內），
+        // 強制改寫 Accept 為 JSON 會讓格式與播放器的 arraybuffer 解析不一致，
+        // 造成該包解析失敗 → 高能進度條消失（但不影響 playurl 走的影片播放本身）。
+        // 只有 subtitle/web/view 本身就是 JSON，才需要這個 header 修正。
         return u.pathname === '/x/v2/subtitle/web/view'
-            || u.pathname === '/x/v2/dm/web/view'
     } catch {
         return false
     }

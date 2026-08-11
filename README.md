@@ -6,7 +6,7 @@
 給台灣使用者看的 Bilibili 影片 CDN 自動切換腳本。  
 它會在播放影片時自動避開比較慢、容易斷線、黑畫面或卡頓的影片節點，並改用目前比較順的節點。
 
-版本：`1.2.2`  
+版本：`1.2.4`  
 作者：`jiyunshi`  
 聯絡信箱：<span>chocosensei214</span><span>&#64;</span><span>gmail</span><span>&#46;</span><span>com</span>
 
@@ -59,6 +59,12 @@ Bilibili 播影片時，影片資料會從不同 CDN 節點下載。
 
 使用 `bili-tw-opt.js` 安裝，或在 Tampermonkey 新增腳本後貼上 `bili-tw-opt.js` 的完整內容並儲存。
 
+> **Chrome / Edge 使用者請注意：** 較新版 Chrome（Manifest V3）要求 Tampermonkey 額外開啟權限，
+> 才能真正把腳本注入頁面。如果安裝後播放器齒輪設定完全沒有出現 CDN 狀態區塊，
+> 請到 `chrome://extensions` → Tampermonkey → **詳細資料** → 開啟 **「允許使用者指令碼」**
+> （Allow User Scripts），再重新整理 Bilibili 頁面。這是瀏覽器擴充功能層級的設定，
+> 腳本本身無法自動開啟。
+
 ### 3. 重新打開 Bilibili 影片頁
 
 建議安裝後先關掉舊的 Bilibili 分頁，再重新打開影片。
@@ -102,6 +108,9 @@ HTTPDNS：auto / block
 - `攔截修改影片CDN` 有勾選：代表腳本正在運作。
 - `緩衝` 達標：代表目前下載狀況大致足夠。
 - `持久死節點`：代表腳本已記住近期不適合你網路的節點，之後會先避開。
+
+如果齒輪設定裡完全沒有這個區塊（不是沒勾選，是整個不見），通常是 Tampermonkey 沒有實際權限注入頁面，
+請看上方[安裝方式](#2-安裝腳本)裡「允許使用者指令碼」的說明。
 
 ---
 
@@ -255,7 +264,14 @@ var PreferredVideoCodec = 'hevc'
 
 版本變更請看 [`CHANGELOG.md`](./CHANGELOG.md)。
 
-**v1.2.2** 為目前推薦版本：已回滾 v1.2.0 穩定邏輯。**請勿繼續使用 v1.2.1**（對外發布後實測不穩定，可能出現 403、CORS、4K 無畫面、cosov HTTP/2 錯誤等問題）。
+**v1.2.4** 為目前推薦版本，主要修正：
+
+- 番劇頁（`bangumi/play/*`）播放器齒輪選單完全看不到「攔截修改影片CDN」選項（`video/*` 正常）。
+- 停用腳本後，若播放器已把片段請求丟進 Worker，該 Worker 仍會繼續改寫 CDN（現在會同步收到停用通知）。
+- 緩衝量測不準：面板的「緩衝」進度、CDN 吞吐評分過去容易量不到真實下載量或算錯下載時間，導致誤判卡頓。
+- 切換到 4K／小時級長片／無損音軌等重內容時，加載明顯變慢：換片時卡在舊片測速排程、剛連線的 slow-start 誤判成卡頓等問題。
+
+詳細說明請看 [`CHANGELOG.md`](./CHANGELOG.md)。**請勿繼續使用 v1.2.1**（對外發布後實測不穩定，可能出現 403、CORS、4K 無畫面、cosov HTTP/2 錯誤等問題）。
 
 ---
 
@@ -292,7 +308,7 @@ var PreferredVideoCodec = 'hevc'
 
 Bilibili CDN Taiwan Optimization is a userscript for improving Bilibili video playback under Taiwan network conditions. It automatically avoids unstable video CDN nodes and switches to faster ones based on real download speed.
 
-Version: `1.2.2`  
+Version: `1.2.4`  
 Author: `Mittag`  
 Contact: <span>chocosensei214</span><span>&#64;</span><span>gmail</span><span>&#46;</span><span>com</span>
 
@@ -311,7 +327,10 @@ This script does not unlock paid videos, bypass region restrictions, or increase
 
 1. Install Tampermonkey.
 2. Install `bili-tw-opt.js`, or paste the full file into a new Tampermonkey script.
-3. Close old Bilibili tabs and reopen a video page.
+3. On Chrome/Edge, if the CDN status panel never shows up in the player settings at all, enable
+   **"Allow User Scripts"** for Tampermonkey under `chrome://extensions` → Tampermonkey → Details
+   (required by Chrome's Manifest V3 for the script to actually run on the page), then reload.
+4. Close old Bilibili tabs and reopen a video page.
 
 ### Basic Usage
 
@@ -348,7 +367,7 @@ BiliCDN.reset()
 
 See [`CHANGELOG.md`](./CHANGELOG.md).
 
-**v1.2.2** is the recommended release (rolled back to v1.2.0 stable logic). **Do not use v1.2.1** — it was unstable in real-world playback (403, CORS, 4K no video, cosov HTTP/2 errors).
+**v1.2.4** is the recommended release. Highlights: the settings checkbox not appearing at all on `bangumi/play/*` pages; a disabled Worker-based CDN rewrite that kept running after the script was toggled off mid-playback; inaccurate buffer/throughput measurement that could misjudge CDN speed; and slow loading right after switching to heavy content (4K, hour-long videos, lossless audio) caused by stale throughput-race state and false stall detection during connection ramp-up. See `CHANGELOG.md` for details. **Do not use v1.2.1** — it was unstable in real-world playback (403, CORS, 4K no video, cosov HTTP/2 errors).
 
 ### License
 

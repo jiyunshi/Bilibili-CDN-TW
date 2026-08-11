@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         Bilibili CDN 台灣優化
 // @namespace    BiliCDN_TW
-// @version      1.2.3
+// @version      1.2.4
 // @description  改善台灣網路觀看 Bilibili 影片時的 CDN 連線穩定度，支援自動切換與卡頓監測
 // @author       jiyunshi <chocosensei214@gmail.com>
 // @license      MIT
@@ -46,7 +46,7 @@ var PreferredVideoCodec = 'hevc'
 
 // ── 診斷輸出 ──────────────────────────────────────────────────────────
 // 預設不輸出背景 log；需要排查時可在 console 執行 BiliCDN.verbose(true)。
-const PluginName = 'BiliCDN_TW_v1.2.3'
+const PluginName = 'BiliCDN_TW_v1.2.4'
 const Config = { verbose: !!GM_getValue('verbose') }
 const log = (...args) => { if (Config.verbose) console.log('[' + PluginName + ']:', ...args) }
 const err = (...args) => { if (Config.verbose) console.error('[' + PluginName + ']:', ...args) }
@@ -148,7 +148,7 @@ const knownDeadHosts = (() => {
 // 升級/首次安裝：清掉舊黑名單+probe 快取，注入預設台灣死節點
 try {
     const installedVersion = GM_getValue('blicdnVersion')
-    if (installedVersion !== '1.2.3') {
+    if (installedVersion !== '1.2.4') {
         // 1.1.0+ 改用實測下載速度挑節點；舊 probe 快取是延遲排序，一律清掉重學
         GM_setValue('probeCache_v1', null)
         const stateSafeVersions = new Set(['1.0.0', '1.1.0', '1.2.0', '1.2.1', '1.2.2', '1.2.3', '1.2.4', '1.3.0', '1.4.0', '4.4.6', '4.5.0', '4.5.1', '4.6.1', '4.6.2', '4.6.3', '4.6.4', '4.6.7', '4.6.8', '4.6.9', '4.7.0'])
@@ -171,7 +171,7 @@ try {
                 } catch {}
             }
         }
-        GM_setValue('blicdnVersion', '1.2.3')
+        GM_setValue('blicdnVersion', '1.2.4')
     }
 } catch {}
 
@@ -677,6 +677,61 @@ const redirectStats = {
     httpdnsAllowed: 0,
     httpdnsAutoSwitch: 0,
     quietRedirects: 0,
+}
+
+// ── Segment 位元組計數去重 ────────────────────────────────────────────
+// 實測：bilivideo.com 的 m4s/flv 走 Range/206 跨源 XHR，Chrome 在這個情境下
+// PerformanceResourceTiming 的 transferSize/encodedBodySize 經常回報 0（即使伺服器
+// 有送 Timing-Allow-Origin），導致 Watchdog 完全抓不到下載量 → 面板永遠「緩衝 0%」、
+// bps 判斷永遠對 4K 半盲、CDN 吞吐評分永遠沒有真實樣本。改為在 XHR/fetch 攔截層直接
+// 用 content-length / response 大小量測真實位元組（見下方 send()/fetch() 攔截），
+// PerformanceObserver 僅作為那條路徑量到值時的補位，用這組去重避免同一個 segment 被算兩次。
+const segmentByteAccountedUrls = new Map()
+const SEGMENT_DEDUP_WINDOW_MS = 5000
+const noteSegmentAccounted = (url) => {
+    if (!url) return
+    const now = Date.now()
+    segmentByteAccountedUrls.set(url, now)
+    if (segmentByteAccountedUrls.size > 64) {
+        segmentByteAccountedUrls.forEach((t, u) => {
+            if (now - t > SEGMENT_DEDUP_WINDOW_MS) segmentByteAccountedUrls.delete(u)
+        })
+    }
+}
+const wasSegmentAccounted = (url) => {
+    const t = url && segmentByteAccountedUrls.get(url)
+    return !!t && (Date.now() - t < SEGMENT_DEDUP_WINDOW_MS)
+}
+
+// XHR 版：直接從 response 量真實位元組（content-length 優先，量不到才退回 response 大小），
+// 不依賴不可靠的 PerformanceResourceTiming。同時餵給 Watchdog（面板 MB/bps 判斷）與
+// recordCdnThroughput（CDN 吞吐評分），並標記去重避免 onEntry() 又重算一次。
+// alreadyReportedBytes：send() 裡的 progress 事件已經即時、逐步回報過的量（見下方），
+// 這裡只把「還沒被 progress 算過的尾巴」補給 Watchdog，避免同一個 segment 被算兩次；
+// recordCdnThroughput 仍用完整 bytes + 真正的下載耗時（startedAt→現在）算吞吐分數。
+const noteSegmentBytes = (cdn, xhr, startedAt, url, alreadyReportedBytes) => {
+    if (!cdn) return
+    try {
+        let bytes = 0
+        const cl = xhr.getResponseHeader && xhr.getResponseHeader('content-length')
+        if (cl) bytes = parseInt(cl, 10) || 0
+        if (!bytes) {
+            try {
+                const r = xhr.response
+                if (r && typeof r.byteLength === 'number') bytes = r.byteLength
+                else if (r && typeof r.size === 'number') bytes = r.size // Blob（responseType: 'blob'）
+                else if ((xhr.responseType === '' || xhr.responseType === 'text') && typeof xhr.responseText === 'string') {
+                    bytes = xhr.responseText.length
+                }
+            } catch {}
+        }
+        if (!bytes) return
+        const durationMs = Math.max(1, Date.now() - startedAt)
+        const remaining  = Math.max(0, bytes - (alreadyReportedBytes || 0))
+        if (remaining) Watchdog.noteExternalBytes(cdn, remaining)
+        recordCdnThroughput(cdn, bytes, durationMs, latestPlaybackRate)
+        noteSegmentAccounted(url)
+    } catch {}
 }
 
 // 緩衝目標依碼率動態調整；未知碼率時使用保守預設。
@@ -1517,7 +1572,7 @@ const interceptNetResponse = (function (theWindow) {
         }
 
         send(...args) {
-            if (this._biliJsonMetadata) {
+            if (this._biliJsonMetadata && !disabled) {
                 try { this.setRequestHeader('Accept', 'application/json, text/plain, */*') } catch {}
             }
 
@@ -1532,11 +1587,32 @@ const interceptNetResponse = (function (theWindow) {
             if (this._originCdn) {
                 const cdn  = this._redirectedCdn || this._originCdn
                 const self = this
+                const segStartedAt = Date.now()
                 let aborted = false
+                let lastProgressLoaded = 0
                 this.addEventListener('abort', () => { aborted = true })
                 this.addEventListener('error', () => {
                     if (aborted) return
                     recordCdnFailure(cdn)
+                })
+                // XHR 的 'load'/readystatechange DONE 要等整包下載完才觸發，大 segment（4K/
+                // 無損）下載期間 Watchdog 完全看不到進度，容易在中段誤判「好幾秒 0 位元組」。
+                // 用 progress 事件的累計 loaded 算出每次的增量，即時餵給 Watchdog，
+                // 讓面板/停滯偵測看到的下載節奏跟真實網路一致。
+                this.addEventListener('progress', (e) => {
+                    if (aborted) return
+                    const loaded = (e && e.loaded) || 0
+                    const delta = loaded - lastProgressLoaded
+                    if (delta > 0) {
+                        lastProgressLoaded = loaded
+                        Watchdog.noteExternalBytes(cdn, delta)
+                        // 邊下載邊刷新去重標記（而不是只在下載完當下標一次）：
+                        // 大 segment 下載期間，PerformanceObserver 的 resource-timing entry
+                        // 理論上要等整包傳完才會送達，但送達時機沒有跟我們的量測同步保證，
+                        // 持續刷新能避免「量測還沒完成、entry 卻先到」造成 onEntry() 重複入帳，
+                        // 也避免下載耗時超過去重視窗（5s）導致標記提早過期。
+                        noteSegmentAccounted(self._interceptUrl)
+                    }
                 })
                 this.addEventListener('readystatechange', function () {
                     if (self.readyState !== XMLHttpRequest.DONE) return
@@ -1547,6 +1623,7 @@ const interceptNetResponse = (function (theWindow) {
                         recordCdnFailure(cdn)
                     } else if (self.status >= 200 && self.status < 400) {
                         recordCdnSuccess(cdn)
+                        noteSegmentBytes(cdn, self, segStartedAt, self._interceptUrl, lastProgressLoaded)
                     }
                 })
             }
@@ -1620,9 +1697,55 @@ const interceptNetResponse = (function (theWindow) {
                   })
                 : effectiveUrl
 
+            const fetchStartedAt = Date.now()
             return OriginalFetch(fetchInput, init).then(res => {
                 if (res.ok) {
                     recordCdnSuccess(targetCdn)
+                    // 注意：fetch() 的 Promise 在「收到 header」就 resolve，body 這時候通常還在傳
+                    // （尤其大檔案／跨國高延遲）。這裡不能用 content-length 當「已經下載完」直接
+                    // 一次性入帳——那會把整包位元組記在 TTFB 那一刻，duration 也被錯算成只有 TTFB，
+                    // 造成吞吐評分嚴重灌水（一個 TTFB 快但傳輸慢的節點會被誤判成最快），
+                    // Watchdog 也會看到「這秒突然滿血、之後好幾秒卻是 0 位元組」的假停滯。
+                    // 改成用 tee() 分流：一份原封不動交給播放器，另一份逐 chunk 即時回報真實下載
+                    // 節奏給 Watchdog，最後用真正的完整下載時間算 CDN 吞吐分數。
+                    try {
+                        if (res.body && typeof res.body.tee === 'function') {
+                            const [forCaller, forCount] = res.body.tee()
+                            res = new Response(forCaller, { status: res.status, statusText: res.statusText, headers: res.headers })
+                            const reader = forCount.getReader()
+                            let counted = 0
+                            const pump = () => reader.read().then(({ done, value }) => {
+                                if (value && value.byteLength) {
+                                    counted += value.byteLength
+                                    Watchdog.noteExternalBytes(targetCdn, value.byteLength)
+                                    // 邊讀邊刷新去重標記：PerformanceObserver 的 resource-timing entry
+                                    // 到達時機跟我們這條逐 chunk 讀取的 tee 分支沒有嚴格順序保證，尤其
+                                    // 大檔案/慢連線下這條路徑可能還沒讀完、entry 卻先送達，若只在 done
+                                    // 時才標記，會讓 onEntry() 把同一包位元組又加一次。持續刷新也順便
+                                    // 避免下載耗時超過去重視窗（5s）導致標記提早過期。
+                                    noteSegmentAccounted(effectiveUrl)
+                                }
+                                if (done) {
+                                    if (counted) {
+                                        recordCdnThroughput(targetCdn, counted, Math.max(1, Date.now() - fetchStartedAt), latestPlaybackRate)
+                                    }
+                                    return
+                                }
+                                return pump()
+                            }).catch(() => {})
+                            pump()
+                        } else {
+                            // 極舊環境沒有 ReadableStream.tee()：退回一次性用 content-length 概算，
+                            // 不夠準（duration 會偏短）但至少不是完全量不到。
+                            const cl = res.headers.get('content-length')
+                            const bytes = cl ? (parseInt(cl, 10) || 0) : 0
+                            if (bytes) {
+                                Watchdog.noteExternalBytes(targetCdn, bytes)
+                                recordCdnThroughput(targetCdn, bytes, Math.max(1, Date.now() - fetchStartedAt), latestPlaybackRate)
+                                noteSegmentAccounted(effectiveUrl)
+                            }
+                        }
+                    } catch {}
                 } else if (HARD_FAIL_STATUSES.has(res.status)) {
                     recordCdnFailure(targetCdn, true)
                 } else if (res.status >= 500) {
@@ -1683,6 +1806,18 @@ const syncWorkerCdnTarget = () => {
     })
 }
 
+// 使用者透過設定面板 checkbox 停用/啟用時同步通知既有 Worker，
+// 否則已建立的 Worker 會在「停用」後仍持續改寫 segment host（disabled 只擋新建 Worker）。
+const syncWorkerDisabledState = () => {
+    biliCdnWorkers.forEach(worker => {
+        try {
+            worker.postMessage({ __biliCdnDisabled: disabled })
+        } catch {
+            biliCdnWorkers.delete(worker)
+        }
+    })
+}
+
 const setupClassicWorkerIntercept = () => {
     try {
         const OriginalWorker = unsafeWindow.Worker
@@ -1700,6 +1835,7 @@ let BILICDN_FORCE = ${JSON.stringify(forceList)};
 const BILICDN_PREFERRED = ${JSON.stringify(preferred)};
 const BILICDN_EXCLUDES = ${JSON.stringify(excludes)};
 let BILICDN_BYTES_PORT = null;
+let BILICDN_DISABLED = false;
 const biliCdnMatchesExclude = (host) => BILICDN_EXCLUDES.some((kw) => kw && host.indexOf(kw) !== -1);
 const biliCdnIsUnstable = (host) =>
     !!host && (/\\.mcdn\\.bilivideo\\.(cn|com)$/i.test(host)
@@ -1715,6 +1851,9 @@ self.addEventListener('message', (event) => {
     }
     if (data && data.__biliCdnBytesPort) {
         BILICDN_BYTES_PORT = data.__biliCdnBytesPort;
+    }
+    if (data && typeof data.__biliCdnDisabled === 'boolean') {
+        BILICDN_DISABLED = data.__biliCdnDisabled;
     }
 });
 // 回報 Worker 內下載的 segment 位元組給主執行緒（主執行緒 PerformanceObserver 看不到 Worker 流量）
@@ -1743,6 +1882,7 @@ const biliCdnNeedsRedirect = (host) =>
         || BILICDN_PREFERRED.indexOf(host) === -1);
 const biliCdnRewrite = (url) => {
     try {
+        if (BILICDN_DISABLED) return url;
         if (!biliCdnIsMedia(url)) return url;
         const u = new URL(url);
         if (!biliCdnNeedsRedirect(u.hostname) || u.hostname === BILICDN_TARGET_HOST) return url;
@@ -1829,7 +1969,7 @@ import(${JSON.stringify(originalUrl)}).catch(() => {});
         const registerWorker = (worker) => {
             biliCdnWorkers.add(worker)
             setTimeout(() => {
-                try { worker.postMessage({ __biliCdnSetTarget: getWorkerCdnTarget(), __biliCdnForce: getWorkerForceList() }) } catch {}
+                try { worker.postMessage({ __biliCdnSetTarget: getWorkerCdnTarget(), __biliCdnForce: getWorkerForceList(), __biliCdnDisabled: disabled }) } catch {}
             }, 0)
             // 建立專屬 MessagePort 接收 Worker 回報的 segment 下載量（不污染播放器訊息通道、不跨分頁）
             try {
@@ -2005,6 +2145,12 @@ let lastBakeoffAt        = 0
 let bakeoffRunning       = false
 let bakeoffTimer         = null
 let lastSampleSegmentUrl = null
+// SPA 換片時遞增；讓仍在跑/排程中的舊片賽馬盡快自我放棄，把頻寬讓給新片。
+// 沒有這個機制時，切到重片（4K/長片/無損）當下若剛好卡在舊片的賽馬排程或執行中，
+// 舊片會佔住 bakeoffTimer/bakeoffRunning 整個週期（最長可到 ~4s 排程 + 最多 4 顆候選 ×3s
+// probe timeout ≈ 12s），新片完全搶不到賽馬，只能沿用舊片留下的健康分數起步，加載明顯變慢。
+let bakeoffEpoch         = 0
+let bakeoffAbortController = null
 
 // 多分頁協調鉤子（預設放行；Main IIFE 啟動跨分頁協調後覆寫）。
 // 多開分頁時若多個分頁同時賽馬會互搶台灣上行頻寬而互相低估吞吐量，故需互斥。
@@ -2013,7 +2159,7 @@ let onBakeoffStart        = () => {}
 
 // 對單一候選量吞吐量：ranged GET，扣掉 TTFB 只算純下載時間，降低 slow-start 偏差。
 // probeBytes 可調：高碼率（4K）用較大量，讓 TCP 慢啟動展開、節點之間分得出快慢。
-const probeCdnThroughput = (cdn, sampleUrl, probeBytes) => new Promise((resolve) => {
+const probeCdnThroughput = (cdn, sampleUrl, probeBytes, externalSignal) => new Promise((resolve) => {
     if (!cdn || blacklistSet.has(cdn) || knownDeadHosts.has(cdn)) return resolve(null)
     const target = replaceUrlHost(sampleUrl, cdn)
     if (!target) return resolve(null)
@@ -2025,7 +2171,19 @@ const probeCdnThroughput = (cdn, sampleUrl, probeBytes) => new Promise((resolve)
     let ttfb   = 0
     let bytes  = 0
 
-    const done = (result) => { clearTimeout(to); try { ctrl.abort() } catch {} ; resolve(result) }
+    // 換片時外部立刻 abort，不用等滿 THRPT_PROBE_TIMEOUT 才放棄舊片的探測。
+    const onExternalAbort = () => { try { ctrl.abort() } catch {} }
+    if (externalSignal) {
+        if (externalSignal.aborted) onExternalAbort()
+        else externalSignal.addEventListener('abort', onExternalAbort, { once: true })
+    }
+
+    const done = (result) => {
+        clearTimeout(to)
+        if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort)
+        try { ctrl.abort() } catch {}
+        resolve(result)
+    }
 
     fetch(target, {
         method: 'GET',
@@ -2059,14 +2217,35 @@ const probeCdnThroughput = (cdn, sampleUrl, probeBytes) => new Promise((resolve)
 })
 
 // 序列探測（非並行）避免候選互搶台灣上行頻寬而互相低估。只測「缺新樣本」的候選。
-const runThroughputBakeoff = async (sampleUrl) => {
+// skipIfFast：現用節點已經跑得夠快時要不要直接跳過整輪賽馬。
+//   true（預設，換片/換畫質起播時用）：夠快就跳過，把頻寬留給正在起播的緩衝。
+//   false（Watchdog 偵測到真的卡頓/fragment 錯誤/週期重評估/手動觸發時用）：
+//   這些情境代表「已經出事」或「就是要主動找有沒有更好的」，不該再被這個捷徑擋掉。
+const runThroughputBakeoff = async (sampleUrl, skipIfFast = true) => {
     if (disabled || resolvedCdn || bakeoffRunning) return
     if (inSeekGrace()) return
     if (!sampleUrl || !isBiliVideoUrl(sampleUrl)) return
     if (Date.now() - lastBakeoffAt < THRPT_BAKEOFF_COOLDOWN) return
     if (!crossTabShouldBakeoff()) return  // 其他分頁正在賽馬 → 本輪跳過
+
+    // 現用節點剛好有新鮮的真實吞吐樣本、且遠高於這支片子實際需要的速度時，
+    // 賽馬本身（連續打 1~4 顆候選、每顆最多 768KB）沒有急迫性，反而會在換片起播
+    // 最搶頻寬的當下再搶一手頻寬（4K/長片/無損正是這種最禁不起搶的情境）。跳過。
+    const preCheckHost = activeCdnList[0]
+    const preHealth    = preCheckHost && cdnHealth[preCheckHost]
+    if (skipIfFast && preHealth && preHealth.samples && preHealth.lastSeen
+        && (Date.now() - preHealth.lastSeen) < THRPT_SAMPLE_FRESH_MS
+        && preHealth.ewmaMbps >= getRequiredStreamMbps() * 1.5) {
+        return
+    }
+
     bakeoffRunning = true
     lastBakeoffAt  = Date.now()
+    // 記下這輪賽馬所屬的片子；換片時 bakeoffEpoch 會遞增，讓下面迴圈提早放棄，
+    // 不用等滿整批候選（最多 4 顆 ×3s timeout）才把 bakeoffRunning 讓出來給新片。
+    const myEpoch = bakeoffEpoch
+    bakeoffAbortController = new AbortController()
+    const mySignal = bakeoffAbortController.signal
     onBakeoffStart()                      // 通知其他分頁本分頁開始賽馬
     // 註：不在此 clear forcedRedirectHosts——原始 base_url 主機一旦被切走必須永遠保持改寫，
     // 否則 segment 會跑回慢節點。清除只在 SPA 換片（新的 base_url）時做。
@@ -2087,10 +2266,15 @@ const runThroughputBakeoff = async (sampleUrl) => {
         const probeBytes = (currentStreamBitsPerSec / 1e6 >= 12) ? 768 * 1024 : THRPT_PROBE_BYTES
         const ok = []
         for (const c of candidates) {
-            if (disabled) break
-            const r = await probeCdnThroughput(c, sampleUrl, probeBytes)
+            if (disabled || myEpoch !== bakeoffEpoch) break
+            const r = await probeCdnThroughput(c, sampleUrl, probeBytes, mySignal)
             if (r) ok.push(r)
         }
+
+        // 這輪賽馬所屬的片子已經被切掉了：拿到的樣本仍照樣入帳（對 CDN 的真實吞吐量測量，
+        // 換到哪片都算數），但跳過「中途切換舊主機」這步——playingHost 是舊片的、新片可能
+        // 早就用別的 CDN，逼著重導反而多繞一手。新片自己的 scheduleBakeoff 會另外排一輪。
+        const stale = myEpoch !== bakeoffEpoch
 
         // 確保探到的候選在 activeCdnList 內，否則 getHealthyCdnList 不會納入排序
         ok.forEach(r => {
@@ -2105,16 +2289,18 @@ const runThroughputBakeoff = async (sampleUrl) => {
             ranked.forEach(c => { if (!activeCdnList.includes(c)) activeCdnList.push(c) })
         }
 
-        const best = activeCdnList[0]
-        // 勝者明顯比現用節點快 → 強制 worker 把舊主機改寫到勝者（中途切換、不 reload）
-        if (best && playingHost && best !== playingHost) {
-            const hb = cdnHealth[best], ho = cdnHealth[playingHost]
-            const mb = (hb && hb.samples) ? hb.ewmaMbps : 0
-            const mo = (ho && ho.samples) ? ho.ewmaMbps : 0
-            if (mb > 0 && mb > mo * THRPT_SWITCH_MARGIN) {
-                forcedRedirectHosts.add(playingHost)
-                log('[Bakeoff] 中途切換 ' + playingHost.split('.')[0] + ' → ' + best.split('.')[0]
-                    + '（' + mo.toFixed(1) + '→' + mb.toFixed(1) + ' Mbps）')
+        if (!stale) {
+            const best = activeCdnList[0]
+            // 勝者明顯比現用節點快 → 強制 worker 把舊主機改寫到勝者（中途切換、不 reload）
+            if (best && playingHost && best !== playingHost) {
+                const hb = cdnHealth[best], ho = cdnHealth[playingHost]
+                const mb = (hb && hb.samples) ? hb.ewmaMbps : 0
+                const mo = (ho && ho.samples) ? ho.ewmaMbps : 0
+                if (mb > 0 && mb > mo * THRPT_SWITCH_MARGIN) {
+                    forcedRedirectHosts.add(playingHost)
+                    log('[Bakeoff] 中途切換 ' + playingHost.split('.')[0] + ' → ' + best.split('.')[0]
+                        + '（' + mo.toFixed(1) + '→' + mb.toFixed(1) + ' Mbps）')
+                }
             }
         }
 
@@ -2122,6 +2308,7 @@ const runThroughputBakeoff = async (sampleUrl) => {
         try { GM_setValue(PROBE_CACHE_KEY, JSON.stringify({ t: Date.now(), list: [...activeCdnList] })) } catch {}
     } finally {
         bakeoffRunning = false
+        if (bakeoffAbortController && bakeoffAbortController.signal === mySignal) bakeoffAbortController = null
     }
 }
 
@@ -2131,9 +2318,15 @@ const scheduleBakeoff = (sampleUrl) => {
     // 4K 開播當下最吃頻寬，測速會跟「初始緩衝」搶頻寬而拖慢起播 →
     // 4K 改為延後較久（先讓畫面開起來、緩衝拉起再測速）；一般畫質維持較短延遲。
     const highBitrate = currentStreamBitsPerSec / 1e6 >= 12
+    const myEpoch = bakeoffEpoch
     bakeoffTimer = setTimeout(() => {
         bakeoffTimer = null
-        runThroughputBakeoff(sampleUrl).catch(() => {})
+        // 換片會在 onSpaNavigate 主動清掉這個 timer，理論上不會用過期 epoch 觸發；
+        // 這裡多一層防呆，避免任何遺漏路徑用舊片樣本跑掉這一輪賽馬名額。
+        if (myEpoch !== bakeoffEpoch) return
+        // 一律用當下最新樣本（而非排程當下 closure 住的那個），避免同一支片內
+        // 中途換畫質/CDN 導致 sampleUrl 過期時仍打舊 URL。
+        runThroughputBakeoff(lastSampleSegmentUrl).catch(() => {})
     }, highBitrate ? 4000 : 1500)
 }
 
@@ -2182,7 +2375,8 @@ const installDashFragmentErrorHook = () => {
         syncWorkerCdnTarget()
         if (lastSampleSegmentUrl && currentStreamBitsPerSec / 1e6 >= 12) {
             lastBakeoffAt = 0
-            runThroughputBakeoff(lastSampleSegmentUrl).catch(() => {})
+            // 已經真的出錯（fragment 下載失敗）才會走到這裡，不能被「現用節點目前還算快」擋掉。
+            runThroughputBakeoff(lastSampleSegmentUrl, false).catch(() => {})
         }
         log('[Dash] fragment 下載失敗，後續改寫 ' + host.split('.')[0] + ' → ' + getCdnShortName())
     }
@@ -2320,6 +2514,11 @@ const Watchdog = (() => {
     const URGENT_BUFFER_SEC = 5
     const REACHED_RECHECK_BUFFER_SEC = 10
     const SWITCH_COOL       = 5000
+    // 剛 reset（開播/換片）那幾秒，TCP/TLS 連線還在 slow-start，量到的瞬時 bps 天生偏低，
+    // 不是 CDN 真的慢。尤其高碼率（4K/長片/無損）換片後最需要這段緩衝時間才能量出真實速度，
+    // 太早判定反而白白觸發一次換節點（重新 DNS/TCP/TLS 又更慢）。高碼率多給一點餘裕。
+    const STARTUP_GRACE_MS       = 3000
+    const STARTUP_GRACE_MS_HIGH  = 5000
 
     let totalBytes        = 0
     let lastBufferedEnd   = 0
@@ -2352,6 +2551,10 @@ const Watchdog = (() => {
     const onEntry = (entry) => {
         if (!entry || !entry.name) return
         if (!/\.m4s($|\?)/i.test(entry.name) && !/\.flv($|\?)/i.test(entry.name)) return
+        // 這個 segment 若已經被 XHR/fetch 攔截層直接量過真實位元組（見 noteSegmentBytes /
+        // fetch 攔截的 content-length 分支），這裡就跳過，避免同一包重複計入兩次。
+        // 這條路徑只在對方量不到時（例如非我方攔截的請求）當備援。
+        if (wasSegmentAccounted(entry.name)) return
         const bytes = entry.transferSize || entry.encodedBodySize || 0
         if (!bytes) return
         totalBytes += bytes
@@ -2439,9 +2642,10 @@ const Watchdog = (() => {
         preconnectBatch(getHealthyCdnList().slice(0, 3), true)
         reorderCdnsByLatency(true).catch(() => {})
         // 4K：卡頓多半是節點速度不夠，立刻實測各節點下載速度，確保切到真的夠快的節點
+        // Watchdog 已經判定停滯才會走到這裡，不能被「現用節點目前還算快」的捷徑擋掉。
         if (currentStreamBitsPerSec / 1e6 >= 12 && lastSampleSegmentUrl) {
             lastBakeoffAt = 0
-            runThroughputBakeoff(lastSampleSegmentUrl).catch(() => {})
+            runThroughputBakeoff(lastSampleSegmentUrl, false).catch(() => {})
         }
         // 不 nudge currentTime：跟 bili player 內建 Stuck:Rescue 搶會 buffer 抖動
         // 軟封鎖 + 下次 segment 走攔截層改 host 就夠
@@ -2528,6 +2732,14 @@ const Watchdog = (() => {
         const minAheadEff = highBitrate ? 30 : MIN_BUFFER_AHEAD
         const recheckEff  = highBitrate ? 20 : REACHED_RECHECK_BUFFER_SEC
         const stallMaxEff = highBitrate ? 2 : STALL_MAX
+
+        // 剛開播/換片幾秒內的 slow-start 緩衝期：只累積 lastBufferedEnd 基準，不判定停滯，
+        // 讓連線先把速度跑起來，避免才剛連上就急著換節點。
+        if (Date.now() - startedAt < (highBitrate ? STARTUP_GRACE_MS_HIGH : STARTUP_GRACE_MS)) {
+            stallCount = 0
+            lastBufferedEnd = be
+            return
+        }
 
         const needMoreBuffer = bufferAhead < minAheadEff
         const urgentBuffer = bufferAhead < URGENT_BUFFER_SEC
@@ -2688,7 +2900,8 @@ unsafeWindow.BiliCDN = {
         }
         lastBakeoffAt = 0
         console.log('[BiliCDN] 開始吞吐量賽馬…（約 1~5 秒）')
-        return runThroughputBakeoff(lastSampleSegmentUrl).then(() => {
+        // 使用者手動要求的，不能被「現用節點目前還算快」的捷徑靜默跳過。
+        return runThroughputBakeoff(lastSampleSegmentUrl, false).then(() => {
             const r = Object.fromEntries(
                 Object.entries(cdnHealth)
                     .filter(([, h]) => h.samples > 0)
@@ -2995,6 +3208,9 @@ startCdnProbe()
 
     // Seek 預熱：僅 seeking（不在 waiting 做 DOM/拆連線，避免卡 seek 主路徑）
     let seekPrewarmStarted = false
+    // SPA 換片後 player 常換掉 <video> 元素；attach 成功後 tryAttach 的 interval 就停了，
+    // 若不重新武裝，換片後新 <video> 永遠收不到 seek 預熱監聽（見 onSpaNavigate 呼叫）。
+    let rearmSeekPrewarm = null
     const setupSeekPrewarm = () => {
         if (seekPrewarmStarted) return
         seekPrewarmStarted = true
@@ -3002,7 +3218,8 @@ startCdnProbe()
         let lastSeekWarmAt = 0
         const SEEK_WARM_GAP_MS = 400
         const ATTACH_TIMEOUT_MS = 30000
-        const attachStartedAt = Date.now()
+        let attachStartedAt = Date.now()
+        let attachTimer = null
 
         const findVideo = () => {
             let best = null, bestArea = 0
@@ -3043,20 +3260,34 @@ startCdnProbe()
             const v = findVideo()
             if (!v && Date.now() - attachStartedAt > ATTACH_TIMEOUT_MS) {
                 clearInterval(attachTimer)
+                attachTimer = null
                 return
             }
             if (!v || v === attached) return
             attached = v
             try { v.preload = 'auto' } catch {}
-            v.addEventListener('seeking', scheduleSeekWarmup)
-            v.addEventListener('seeked', onSeeked)
-            v.addEventListener('ratechange', () => {
-                if (v.playbackRate > 1.5) warmupSeek()
-            })
+            // rearmSeekPrewarm() 只重置 attached，不代表 DOM 換了新的 <video> 元素——
+            // 有些情境（同一元素僅換 src）換片後還是同一個節點，若不擋，每次換片都會對
+            // 同一個 <video> 重複掛一輪監聽，seek 一次觸發 N 次 warmup/Watchdog.noteSeek。
+            if (!v.__biliCdnSeekBound) {
+                v.__biliCdnSeekBound = true
+                v.addEventListener('seeking', scheduleSeekWarmup)
+                v.addEventListener('seeked', onSeeked)
+                v.addEventListener('ratechange', () => {
+                    if (v.playbackRate > 1.5) warmupSeek()
+                })
+            }
             clearInterval(attachTimer)
+            attachTimer = null
         }
-        const attachTimer = setInterval(tryAttach, 800)
+        attachTimer = setInterval(tryAttach, 800)
         tryAttach()
+
+        rearmSeekPrewarm = () => {
+            attached = null
+            attachStartedAt = Date.now()
+            if (!attachTimer) attachTimer = setInterval(tryAttach, 800)
+        }
     }
 
     // ── SPA 換片偵測 ────────────────────────────────────────────────────
@@ -3075,8 +3306,16 @@ startCdnProbe()
         forcedRedirectHosts.clear()
         lastBakeoffAt = 0           // 解除冷卻，新片可立即賽馬
         lastSampleSegmentUrl = null
+        // 放棄舊片還沒發出/還在跑的賽馬，把名額讓給新片：
+        // - 還沒發出（排程中）：epoch 不符，scheduleBakeoff 的 timeout 觸發時直接跳過。
+        // - 已經在跑：epoch 不符讓迴圈提早跳出 + abort 訊號讓當前這顆 probe 立刻斷線，
+        //   不用等滿 3s timeout，bakeoffRunning 才能盡快讓新片的賽馬排得進去。
+        bakeoffEpoch++
+        if (bakeoffTimer) { clearTimeout(bakeoffTimer); bakeoffTimer = null }
+        if (bakeoffAbortController) { try { bakeoffAbortController.abort() } catch {} ; bakeoffAbortController = null }
         try { Watchdog.reset() } catch {}
         syncWorkerCdnTarget()
+        if (rearmSeekPrewarm) rearmSeekPrewarm()
         log('[SPA] 換片：' + key + '，重置選節點狀態')
     }
     const hookHistory = () => {
@@ -3130,7 +3369,9 @@ startCdnProbe()
                 if (disabled || resolvedCdn || !lastSampleSegmentUrl) return
                 // 背景分頁不主動週期賽馬：player 仍靠偽裝續播，省頻寬並避免多分頁互搶
                 if (tabReallyHidden) return
-                runThroughputBakeoff(lastSampleSegmentUrl).catch(() => {})
+                // 這裡就是專門為了「現用節點目前還算快，但擁塞會隨時段漂移，
+                // 說不定有更快的」而存在的，不能被同一個理由的捷徑自己擋掉自己。
+                runThroughputBakeoff(lastSampleSegmentUrl, false).catch(() => {})
             }, 4 * 60 * 1000)
         }
     }
@@ -3149,9 +3390,27 @@ startCdnProbe()
     }
     startRuntimeFeatures()
 
-    waitForElm(
-        '#bilibili-player > div > div > div.bpx-player-primary-area > div.bpx-player-video-area > div.bpx-player-control-wrap > div.bpx-player-control-entity > div.bpx-player-control-bottom > div.bpx-player-control-bottom-right > div.bpx-player-ctrl-btn.bpx-player-ctrl-setting > div.bpx-player-ctrl-setting-box > div > div > div > div > div > div > div.bpx-player-ctrl-setting-others'
-    , 30000).then(settingsBar => {
+    // 只認 class，不鎖死中間包裝層數：bangumi/play（OGV 播放器）在 setting box 內部的
+    // wrapper 層數與 video（UGC 播放器）不同，鎖死完整路徑會導致 waitForElm 逾時、
+    // 「攔截修改影片 CDN」選項在番劇頁完全不出現（且預設不 verbose，使用者看不到任何錯誤）。
+    // 只認 class 換來的代價：若頁面同時存在一個以上 .bpx-player-ctrl-setting-others
+    // （例如浮動小視窗播放器、續播預覽卡用了同一套播放器元件），document.querySelector
+    // 只會拿到 DOM 順序第一個，不一定是實際在播放的主播放器。有多個候選時，挑「最近的
+    // <video> 面積最大」那個，跟 findVideo()/getVideo() 判斷主播放器的方式一致。
+    const pickMainSettingsAnchor = (first) => {
+        const all = document.querySelectorAll('.bpx-player-ctrl-setting-others')
+        if (all.length <= 1) return first
+        let best = first, bestArea = -1
+        all.forEach(node => {
+            const root = node.closest('[id*="bilibili-player"], [class*="bpx-player"]') || node
+            const video = root.querySelector && root.querySelector('video')
+            const area = video ? (video.clientWidth || 0) * (video.clientHeight || 0) : 0
+            if (area > bestArea) { bestArea = area; best = node }
+        })
+        return best
+    }
+    waitForElm('.bpx-player-ctrl-setting-others', 30000).then(found => {
+        const settingsBar = pickMainSettingsAnchor(found)
 
         settingsBar.appendChild(fromHTML(
             '<div class="bpx-player-ctrl-setting-others-title">' + SettingsBarTitle + '</div>'
@@ -3179,6 +3438,7 @@ startCdnProbe()
             GM_setValue('disabled', disabled)
             if (disabled) stopRuntimeFeatures()
             else startRuntimeFeatures()
+            syncWorkerDisabledState()
             updateStatusPanel()
         })
 

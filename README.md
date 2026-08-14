@@ -3,299 +3,122 @@
 <a name="zh-tw"></a>
 <a name="chinese"></a>
 
-給台灣使用者看的 Bilibili 影片 CDN 自動切換腳本。  
-它會在播放影片時自動避開比較慢、容易斷線、黑畫面或卡頓的影片節點，並改用目前比較順的節點。
+給台灣使用者的 Bilibili 影片 CDN 自動切換腳本——自動避開卡頓、黑畫面、連不上的節點，換用比較順的。
 
-版本：`1.2.4`  
-作者：`jiyunshi`  
-聯絡信箱：<span>chocosensei214</span><span>&#64;</span><span>gmail</span><span>&#46;</span><span>com</span>
+版本 `1.3.0` ・ 作者 `jiyunshi` ・ <span>chocosensei214</span><span>&#64;</span><span>gmail</span><span>&#46;</span><span>com</span>
 
 語言：[繁體中文](#zh-tw) | [English](#english)
 
 ---
 
-## 這是什麼？
+## 這個腳本在做什麼
 
-Bilibili 播影片時，影片資料會從不同 CDN 節點下載。  
-有些節點在台灣很順，有些節點會很慢、連不上、黑畫面，或播放 4K 時一直轉圈。
+Bilibili 的影片資料會從很多不同的 CDN 節點下載，有些在台灣很順，有些會很慢、連不上或一直轉圈。
 
-這個腳本會自動幫你：
+裝上這個腳本後，它會自動：
 
-- 避開台灣常見不穩的 Bilibili 影片 CDN。
-- 開播後測一下實際下載速度，挑比較快的節點。
-- 播放中如果下載速度跟不上，會自動換節點。
-- 看 4K、高碼率、HEVC、AV1 時，會更早判斷節點是否載不動。
-- 拖時間軸時減少重拉與反覆卡住。
-- 切到背景分頁後，影片仍盡量持續載入。
-- 多開 Bilibili 分頁時，避免每個分頁同時測速互搶頻寬。
+- 避開台灣常見不穩的節點，優先用順的。
+- 播放中如果下載跟不上，自動換一個節點，不用你手動選。
+- 4K／高畫質、拖時間軸、切到背景分頁、多開分頁等情境都有額外優化。
 
-你不需要懂 CDN，也不需要手動設定。安裝後重新整理 Bilibili 影片頁即可。
+你不用懂 CDN，也不用設定，裝好重整頁面就生效。
+
+它**不是**破解工具：不能解鎖會員影片、不能繞地區限制、也不能讓你的網路變快。如果本來的網速就不夠看 4K，換 CDN 幫不了，請先降畫質。
 
 ---
 
-## 這不能做什麼？
+## 安裝
 
-這不是破解工具。
+1. **裝 Tampermonkey**：Chrome / Edge / Brave 到線上應用程式商店搜尋 `Tampermonkey`；Firefox 到 Add-ons 搜尋。
+2. **裝腳本**：用 `bilibili-cdn-tw.user.js` 安裝，或新增腳本後把內容整份貼上存檔。
+3. **重開 Bilibili 影片頁**：建議先關掉舊分頁再重新打開，支援一般影片、番劇、電影、紀錄片、課程等播放頁。
 
-- 不能解鎖會員影片。
-- 不能繞過地區限制。
-- 不能繞過登入或授權檢查。
-- 不能讓你的網路變快。
-
-如果你的實際網速本來就不夠播放 4K，換 CDN 也無法完全解決，請先降畫質。
+> **Chrome / Edge 完全沒看到 CDN 狀態區塊？** 新版 Chrome 需要額外授權才能讓 Tampermonkey 生效：`chrome://extensions` → Tampermonkey → 詳細資料 → 開啟「允許使用者指令碼」，再重整頁面。這是瀏覽器的設定，腳本自己開不了。
 
 ---
 
-## 安裝方式
+## 怎麼確認它有在運作
 
-### 1. 安裝 Tampermonkey
-
-先在瀏覽器安裝 Tampermonkey。
-
-- Chrome / Edge / Brave：到 Chrome 線上應用程式商店搜尋 `Tampermonkey`。
-- Firefox：到 Firefox Add-ons 搜尋 `Tampermonkey`。
-
-### 2. 安裝腳本
-
-使用 `bili-tw-opt.js` 安裝，或在 Tampermonkey 新增腳本後貼上 `bili-tw-opt.js` 的完整內容並儲存。
-
-> **Chrome / Edge 使用者請注意：** 較新版 Chrome（Manifest V3）要求 Tampermonkey 額外開啟權限，
-> 才能真正把腳本注入頁面。如果安裝後播放器齒輪設定完全沒有出現 CDN 狀態區塊，
-> 請到 `chrome://extensions` → Tampermonkey → **詳細資料** → 開啟 **「允許使用者指令碼」**
-> （Allow User Scripts），再重新整理 Bilibili 頁面。這是瀏覽器擴充功能層級的設定，
-> 腳本本身無法自動開啟。
-
-### 3. 重新打開 Bilibili 影片頁
-
-建議安裝後先關掉舊的 Bilibili 分頁，再重新打開影片。
-
-支援常見 Bilibili 播放頁，例如：
-
-- `www.bilibili.com/video/*`
-- `www.bilibili.com/bangumi/play/*`
-- 番劇、電影、紀錄片、課程等播放頁
-
----
-
-## 一般使用方式
-
-正常情況下不用操作。
-
-1. 開啟 Bilibili 影片頁。
-2. 選擇你要看的畫質。
-3. 讓腳本自動選 CDN。
-
-腳本預設不會一直跳提示，也不會一直輸出 log。
-
----
-
-## 如何確認有沒有生效？
-
-在 Bilibili 影片頁右下角點播放器齒輪，設定面板底部會多出 CDN 狀態區塊。
-
-你會看到類似：
+播放器右下角點齒輪，設定面板底部會多一塊 CDN 狀態資訊，大概長這樣：
 
 ```text
 ☑ 攔截修改影片CDN
 白名單：aliov > ali > cos
 緩衝：21.21/20.00MB (100%) | buf=180s ✓達標
-持久死節點（7d）：hwov, hw, hz-aliov
-HTTPDNS：auto / block
 ```
 
-簡單看這幾個就好：
-
-- `攔截修改影片CDN` 有勾選：代表腳本正在運作。
-- `緩衝` 達標：代表目前下載狀況大致足夠。
-- `持久死節點`：代表腳本已記住近期不適合你網路的節點，之後會先避開。
-
-如果齒輪設定裡完全沒有這個區塊（不是沒勾選，是整個不見），通常是 Tampermonkey 沒有實際權限注入頁面，
-請看上方[安裝方式](#2-安裝腳本)裡「允許使用者指令碼」的說明。
+有勾選 + 緩衝達標，就代表在正常運作。如果齒輪選單裡完全沒有這塊（不是沒勾選、是整個不見），通常是上面提到的 Tampermonkey 授權沒開。
 
 ---
 
-## 常見情境
+## 卡頓時怎麼辦
 
-### 開播時
+依序試：重整頁面 → 降一階畫質 → 關掉/換 VPN 節點 → 重開瀏覽器。
 
-腳本會先使用目前排序較好的節點。播放幾秒後，會依實際下載速度重新判斷，如果有更好的 CDN，後續影片片段會自動改用它。
-
-### 看 4K 或高畫質
-
-4K 需要的下載速度比較高。腳本會多留一些緩衝，並更早切換跟不上的節點。
-
-如果還是一直轉圈，通常代表：
-
-- 目前網速不夠 4K。
-- Wi-Fi 或 VPN 不穩。
-- Bilibili 當下服務不穩。
-- 瀏覽器硬體解碼不順。
-
-這時建議先降一階畫質。
-
-### 拖時間軸
-
-拖時間軸時，腳本會暫時避免換 CDN 和測速，減少播放器重拉片段造成的卡頓。
-
-### 切到背景分頁
-
-腳本會讓影片盡量繼續載入，減少切回來時重新加載。背景分頁不會主動測速，以免浪費頻寬。
-
-### 多開分頁
-
-多個 Bilibili 分頁同時播放時，腳本會協調測速，避免每個分頁一起測速互搶頻寬。
-
----
-
-## 卡頓時先做什麼？
-
-照順序試：
-
-1. 重新整理影片頁。
-2. 降一階畫質。
-3. 關掉 VPN，或換另一個 VPN 節點。
-4. 重開瀏覽器。
-5. 如果你剛換網路、VPN、手機熱點，請清除舊紀錄。
-
-清除舊紀錄需要開啟瀏覽器開發者工具，在 `Console` 輸入：
+如果是剛換了網路、VPN 或熱點，腳本記住的舊節點資料可能不適用了，開 `F12` 到 Console 貼：
 
 ```js
 BiliCDN.reset()
 location.reload()
 ```
 
-這會清掉腳本記住的 CDN 狀態，讓它重新學習目前網路環境。
+這樣它會忘記舊資料、重新學習目前的網路環境。
+
+想暫時關掉腳本：在設定面板取消勾選「攔截修改影片CDN」，或直接去 Tampermonkey 面板停用整支腳本。
 
 ---
 
-## 重要指令
+<details>
+<summary><strong>進階：指令、設定選項、支援範圍（一般使用者不需要看）</strong></summary>
 
-一般使用者通常不需要用指令。只有排查問題時才需要。
+### Console / 選單指令
 
-開啟方式：按 `F12`，切到 `Console`，輸入指令。
+大部分情況用不到，只有排查問題才需要。點 Tampermonkey 圖示 → 這支腳本的選單，就有「重置」「診斷資訊」「立即測速」等按鈕，不用打字。想自己打指令的話，`F12` 開 Console：
 
-### 查看目前狀態
+| 指令 | 作用 |
+|---|---|
+| `BiliCDN.diag()` | 看目前狀態 |
+| `BiliCDN.buf()` | 看緩衝與下載速度 |
+| `BiliCDN.bakeoff()` | 手動重新測速選 CDN（先播放幾秒再打） |
+| `BiliCDN.clearDead()` | 只清除「記住的壞節點」，換網路後可用 |
+| `BiliCDN.reset()` | 全部重置，狀態怪怪的時候用 |
 
-```js
-BiliCDN.diag()
-```
+### 進階設定
 
-### 查看緩衝與下載速度
-
-```js
-BiliCDN.buf()
-```
-
-### 手動測速並重新挑 CDN
-
-請先播放影片幾秒，再輸入：
+腳本開頭有幾個變數可以改，一般不需要動：
 
 ```js
-BiliCDN.bakeoff()
+var CustomCDN = ''              // 留空 = 自動選 CDN（建議）；填 host 名稱 = 固定用某個節點
+var ExcludeHostKeywords = ['cosov']  // host 名稱含這些字就不用（預設避開較不穩的 cosov 類節點）
+var BlockHttpDNS = 'auto'       // 'auto' 自動判斷 / true 永遠擋 / false 永遠放行
+var PreferredVideoCodec = 'hevc' // 4K 優先用 HEVC 省頻寬，沒有硬解會自動退回 AVC
+var BlockWebRTC = true          // 擋 WebRTC，避免拖慢跨國連線；若其他功能需要 WebRTC 可設 false
 ```
 
-### 清除死節點紀錄
+### 支援範圍
 
-換網路、VPN、手機熱點後可以用：
+- 支援 Tampermonkey、多數情況下 Violentmonkey 也可用，`www.bilibili.com` 常見播放頁。
+- 不支援 Greasemonkey 4+、`m.bilibili.com` 手機版網頁、非 Bilibili 網站，也不能繞過會員/登入/地區限制。
 
-```js
-BiliCDN.clearDead()
-location.reload()
-```
+### 隱私
 
-### 全部重置
+不會把任何資料上傳到第三方伺服器，只在 Tampermonkey 本機存一點狀態（例如記住哪些節點最近不穩），純粹是為了下次能更快避開。
 
-遇到狀態怪怪的、不知道怎麼判斷時用：
-
-```js
-BiliCDN.reset()
-location.reload()
-```
-
----
-
-## 想暫時關閉
-
-有兩種方式：
-
-- 在播放器齒輪設定底部，取消勾選 `攔截修改影片CDN`。
-- 到 Tampermonkey 面板停用這個腳本。
-
----
-
-## 預設設定
-
-一般使用者不用改。
-
-```js
-var CustomCDN = ''
-var ExcludeHostKeywords = ['cosov']
-var BlockHttpDNS = 'auto'
-var PreferredVideoCodec = 'hevc'
-```
-
-簡單說：
-
-- `CustomCDN = ''`：自動選 CDN，推薦。
-- `ExcludeHostKeywords = ['cosov']`：避開部分台灣網路上較不穩的 cosov 類節點。
-- `BlockHttpDNS = 'auto'`：自動判斷是否阻擋 HTTPDNS。
-- `PreferredVideoCodec = 'hevc'`：優先使用 HEVC，通常比較省頻寬，適合高畫質。
-
----
-
-## 支援範圍
-
-支援：
-
-- Tampermonkey。
-- Violentmonkey 多數情況可用。
-- `www.bilibili.com` 常見播放頁。
-
-不支援：
-
-- Greasemonkey 4+。
-- `m.bilibili.com` 手機版網頁。
-- 非 Bilibili 網站。
-- 會員、登入、地區或授權限制繞過。
+</details>
 
 ---
 
 ## 更新紀錄
 
-版本變更請看 [`CHANGELOG.md`](./CHANGELOG.md)。
+完整版本異動請看 [`CHANGELOG.md`](./CHANGELOG.md)。目前建議使用 **v1.3.0**——修正了簽名過期時全部節點一起被誤判成壞掉、緩衝量測不準、Akamai 節點緩衝卡在 0%、HTTPDNS 判斷失準等問題，也新增了 Tampermonkey 選單指令。
 
-**v1.2.4** 為目前推薦版本，主要修正：
-
-- 番劇頁（`bangumi/play/*`）播放器齒輪選單完全看不到「攔截修改影片CDN」選項（`video/*` 正常）。
-- 停用腳本後，若播放器已把片段請求丟進 Worker，該 Worker 仍會繼續改寫 CDN（現在會同步收到停用通知）。
-- 緩衝量測不準：面板的「緩衝」進度、CDN 吞吐評分過去容易量不到真實下載量或算錯下載時間，導致誤判卡頓。
-- 切換到 4K／小時級長片／無損音軌等重內容時，加載明顯變慢：換片時卡在舊片測速排程、剛連線的 slow-start 誤判成卡頓等問題。
-
-詳細說明請看 [`CHANGELOG.md`](./CHANGELOG.md)。**請勿繼續使用 v1.2.1**（對外發布後實測不穩定，可能出現 403、CORS、4K 無畫面、cosov HTTP/2 錯誤等問題）。
+**請勿繼續使用 v1.2.1**，對外發布後證實不穩定（403、CORS、4K 無畫面等問題）。
 
 ---
 
-## 隱私
+## 授權
 
-腳本不會把你的資料上傳到第三方伺服器。
-
-它只會在 Tampermonkey 本機儲存少量狀態，例如：
-
-- 是否開啟詳細 log。
-- 固定 CDN 設定。
-- 近期失敗或不可用的 CDN。
-- CDN 速度與健康分數。
-- HTTPDNS 自動判斷結果。
-
-這些資料只用來讓腳本下次更快避開不穩節點。
-
----
-
-## 授權與聲明
-
-本腳本採用 **MIT License** 發布，腳本 metadata 內含 `// @license MIT`。
-
-本腳本依現況提供，不保證一定改善所有網路環境。使用者需自行確認符合所在地法律、Bilibili 服務條款，以及所使用瀏覽器與 userscript 管理器的規範。
+MIT License，依現況提供，不保證能改善所有網路環境。使用時請自行確認符合所在地法律與 Bilibili 服務條款。
 
 ---
 
@@ -306,69 +129,25 @@ var PreferredVideoCodec = 'hevc'
 
 [繁體中文](#zh-tw)
 
-Bilibili CDN Taiwan Optimization is a userscript for improving Bilibili video playback under Taiwan network conditions. It automatically avoids unstable video CDN nodes and switches to faster ones based on real download speed.
+A userscript that improves Bilibili video playback for Taiwan network conditions — it automatically avoids slow or broken CDN nodes and switches to faster ones based on real download speed.
 
-Version: `1.2.4`  
-Author: `Mittag`  
-Contact: <span>chocosensei214</span><span>&#64;</span><span>gmail</span><span>&#46;</span><span>com</span>
+Version `1.3.0` ・ Author `jiyunshi` ・ <span>chocosensei214</span><span>&#64;</span><span>gmail</span><span>&#46;</span><span>com</span>
 
-### What It Does
+**What it does:** avoids unstable nodes, switches CDN automatically when playback can't keep up, and adds extra handling for 4K, seeking, background tabs, and multiple open tabs. It does **not** unlock paid videos, bypass region locks, or increase your actual bandwidth.
 
-- Avoids unstable Bilibili video CDN nodes.
-- Measures real video segment download speed.
-- Switches CDN automatically when playback cannot keep up.
-- Improves 4K and high-bitrate playback stability.
-- Keeps video loading when the tab is in the background.
-- Coordinates speed tests across multiple tabs.
+**Install:** 1) install Tampermonkey, 2) install `bilibili-cdn-tw.user.js` (or paste the full file into a new script), 3) close old Bilibili tabs and reopen a video page. If the CDN panel never appears on Chrome/Edge, enable **"Allow User Scripts"** for Tampermonkey under `chrome://extensions` → Details (required by Manifest V3), then reload.
 
-This script does not unlock paid videos, bypass region restrictions, or increase your actual bandwidth.
+**Confirm it's active:** open the player settings gear — a CDN status panel should appear near the bottom.
 
-### Installation
-
-1. Install Tampermonkey.
-2. Install `bili-tw-opt.js`, or paste the full file into a new Tampermonkey script.
-3. On Chrome/Edge, if the CDN status panel never shows up in the player settings at all, enable
-   **"Allow User Scripts"** for Tampermonkey under `chrome://extensions` → Tampermonkey → Details
-   (required by Chrome's Manifest V3 for the script to actually run on the page), then reload.
-4. Close old Bilibili tabs and reopen a video page.
-
-### Basic Usage
-
-No manual action is required. Open a Bilibili video page, choose the quality, and let the script work automatically.
-
-To confirm it is active, open the player settings from the gear icon. A CDN status panel should appear near the bottom.
-
-### Troubleshooting
-
-If playback still buffers:
-
-1. Reload the video page.
-2. Lower the video quality.
-3. Disable VPN or try another VPN node.
-4. Restart the browser.
-5. If you changed network or VPN, reset the learned state:
+**If playback still buffers:** reload the page, lower the quality, check your VPN, or restart the browser. If you just changed network/VPN, reset the learned state:
 
 ```js
 BiliCDN.reset()
 location.reload()
 ```
 
-Useful console commands:
+Other useful commands: `BiliCDN.diag()`, `BiliCDN.buf()`, `BiliCDN.bakeoff()`, `BiliCDN.clearDead()`.
 
-```js
-BiliCDN.diag()
-BiliCDN.buf()
-BiliCDN.bakeoff()
-BiliCDN.clearDead()
-BiliCDN.reset()
-```
+**Changelog:** see [`CHANGELOG.md`](./CHANGELOG.md). **v1.3.0** is the recommended release — fixes a false-positive that could blacklist every CDN node at once when the playurl signature expires, inaccurate buffer/throughput measurement, the buffer panel getting stuck at 0% on Akamai-routed videos, and HTTPDNS auto-detection scoring. **Do not use v1.2.1** — it was unstable in real-world playback.
 
-### Changelog
-
-See [`CHANGELOG.md`](./CHANGELOG.md).
-
-**v1.2.4** is the recommended release. Highlights: the settings checkbox not appearing at all on `bangumi/play/*` pages; a disabled Worker-based CDN rewrite that kept running after the script was toggled off mid-playback; inaccurate buffer/throughput measurement that could misjudge CDN speed; and slow loading right after switching to heavy content (4K, hour-long videos, lossless audio) caused by stale throughput-race state and false stall detection during connection ramp-up. See `CHANGELOG.md` for details. **Do not use v1.2.1** — it was unstable in real-world playback (403, CORS, 4K no video, cosov HTTP/2 errors).
-
-### License
-
-Released under the **MIT License**. Provided as-is, with no guarantee that it will improve every network environment.
+**License:** MIT, provided as-is with no guarantee it improves every network environment.

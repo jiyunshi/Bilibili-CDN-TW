@@ -1,5 +1,66 @@
 # Changelog
 
+## v1.3.0
+
+> 本版全面對照 v1.2.4 逐項稽核結果（3 項 P0、7 項 P1、9 項 P2、10 項 P3，共 29 項）落地修正，共處理 27/29 項。以下依主題分類。
+
+**CDN 選路核心邏輯**
+
+- 修正：Bilibili playurl 網址簽名（`deadline`/`upsig`）過期時，播放器會對所有 `backup_url` 重試，短時間內多個不同節點各拿一次 403——這不是節點壞掉，是「門票」全體失效。舊版把每個 403 都當硬失敗標死 7 天，等於在簽名過期的瞬間把所有候選節點一次封光。現在 15 秒內偵測到 ≥2 個不同 host 都 403 會判定為簽名過期、不處罰任何節點；只有單一 host 403 才軟隔離觀察 10 分鐘（不直接標死）。
+- 修正：節點評分（UCB 選路演算法）的分數尺度沒有正規化——吞吐量用原始 Mbps（可能到 100+），探索加成固定在 2.5 左右，導致節點越快、探索力道越弱，節點越慢、探索反而越強，跟演算法設計的初衷相反。改為把吞吐量正規化到 0~1（2 倍需求速度視為滿分），懲罰項換算到同一級距。
+- 修正：折扣式 UCB 只把吞吐量樣本的「分數」隨時間衰減，沒有同步衰減「樣本數」，導致久沒測過的好節點因為 samples 仍是舊的大數字，探索加成低，永遠不會被重新測試，即使它現在其實最快。改為樣本數也用同一個半衰期（8 分鐘）衰減，讓久未使用的節點自然回到探索池。
+- 修正：`forcedRedirectHosts`（賽馬中途切換 / fragment 下載失敗後強制改寫的主機清單）只增不減，只有換片才清空——長片裡一次偶發網路抖動就會讓某節點整部片被永久放逐。改成有 10 分鐘時效的 Map，跟 `softBlockCdn` 的機制一致。
+- 修正：`getRequiredStreamMbps` 統一用「下載到碼率的 75%」當門檻，這在起播/緩衝充足時合理，但在穩態播放（緩衝已打平）時長期低於碼率必定慢慢吃完緩衝，門檻理應更接近 100%。加入 `mode` 參數區分 `startup`（75%，可容忍暫時性不足）與 `steady`（105%，跟真實碼率一致），各呼叫點按情境套用正確模式。
+- 優化：賽馬中途切換的門檻從固定的 1.25 倍改成依候選節點樣本數動態調整（樣本 ≥4 時 1.15 倍即可切、只有 1 個樣本時要快 60% 才切），避免單次 384KB 探測剛好撞上 slow-start 或網路瞬間空檔就誤觸切換。
+- 優化：首次安裝時預設判定「台灣不可用」的節點（`hwov`/`hw`/`hz-aliov`）不再直接標死 7 天，改成起跑墊底（仍在探索池內，會被實測一次），避免不同 ISP/VPN 路由差異下誤殺實際上最快的節點。
+- 修正：`reorderCdnsByLatency` 與賽馬測速都會整批清空重寫 `activeCdnList`，兩者若同時觸發（例如卡頓瞬間）可能出現「瞬間沒有任何節點」的空窗。加上重入防呆旗標，並讓兩者互斥執行。
+
+**緩衝量測 / 吞吐量準確度**
+
+- 修正：量測「下載耗時」的方式在 XHR segment、fetch segment、賽馬 probe、`PerformanceResourceTiming` 四個地方定義不一致，有的含 TCP/TLS 握手與排隊時間、有的不含，跨國連線的握手可能佔 200~400ms，混在同一個 EWMA 裡等於在比較不同量綱的數字，會讓賽馬測到的速度系統性高於播放時測到的速度，誘發不必要的中途切換與抖動。統一改成優先使用「純傳輸時間」（扣除 TTFB），只有樣本不足以判斷起點時才退回含 TTFB 的完整耗時，避免除以接近 0 的時間差撐出天文數字的假 Mbps 污染 EWMA。
+- 修正：Worker 內的 fetch/XHR 攔截，先前是收到 response header 就把 `content-length` 整包入帳，或等整包下完才報一次，導致主執行緒的 Watchdog 看到「好幾秒 0 位元組、突然一大包」的假停滯而誤判卡頓換節點。改成跟主執行緒一致：fetch 用 `tee()` 逐 chunk 節流回報，XHR 改用 `progress` 事件累計回報。
+- 修正：只要影片被 Bilibili 分到 Akamai 節點，緩衝面板的下載進度就整支片子動不了（永遠 0%），即使播放完全正常——因為量測攔截層過去只認「已經被標記為 forced-redirect」的 Akamai host 才算媒體片段。放寬判斷邏輯讓 Akamai 的 `.m4s`/`.flv`/`upgcxcode` 一律計入量測（不影響原本的改寫邏輯，只是讓「量測」對它也生效）。
+- 修正：XHR 若以 `responseType: 'blob'` 取得 segment，且伺服器沒送 `content-length`，位元組量測會直接失敗、既不計入緩衝面板也不計入 CDN 吞吐評分（承接自 v1.2.4 遺留問題的延伸修正）。
+- 優化：Watchdog 的即時下載速度（bps）過去用固定 1 秒當分母，`setInterval` 實際間隔漂移（主執行緒忙碌、背景節流）時會被高估最多 3 倍，導致該判定「太慢」時漏判。改用實際經過時間當分母。
+
+**HTTPDNS AutoPilot**
+
+- 修正：評分公式把 MiB/s 誤標成變數名 `mbps`（實際少算了 8 倍），且用絕對速度（`mbps*100`）打分——正常 4K 播放輕鬆到 300~500 分，卡頓只扣 50 分等於總分的 10~15%，代價太便宜，且判斷通過的門檻 `HTTPDNS_SCORE_MARGIN=8` 對上這個級距形同虛設，任何雜訊都能跨過。改成相對於「這支片子實際需要的速度」計算達成率（封頂 120%），卡頓/硬失敗/切換的懲罰佔比重新配平，門檻同步調整到有實際意義的比例。
+- 修正：SPA 換片時 `Watchdog.reset()` 會把累計位元組歸零，若 HTTPDNS 正在跑 trial（短期試放行觀察），下一次結算會拿「換片前的大 baseline」對「換片後才剛開始累計的小 sample」相減，變成負數被夾成 0，trial 幾乎必然被判定失敗、進而被誤鎖定「阻擋 HTTPDNS」6 小時。換片時偵測到 baseline 異常就直接用新片的 sample 原值，並重新起算觀察窗，讓新片有完整的試用時間。
+- 清理：移除名存實亡的 `session`/`beginSession`/`noteBytes`/`noteStall`/`noteSwitch`/`noteHardFail`/`finalizeSession` 機制（約 40 行死碼，`noteBytes` 尤其在每個下載 chunk 都會被呼叫一次），直接用 Watchdog 的累計值記分。
+- 修正：`Watchdog.noteHardFail()` 過去沒有任何地方會被呼叫，導致 HTTPDNS 評分公式裡的「硬失敗次數」懲罰項形同虛設，現在正確串接到 `recordCdnFailure` 的硬失敗分支。
+
+**畫質 / 硬體解碼**
+
+- 優化：`PreferredVideoCodec = 'hevc'` 過去只檢查瀏覽器「能不能播」HEVC/AV1，不檢查「播得順不順」——很多 Windows 機器沒有 HEVC 硬體解碼，4K HEVC 軟解會讓 CPU 吃滿掉幀，體感比直接看 AVC 還差。改用 Media Capabilities API 偵測是否硬體解碼（`powerEfficient`），軟解時 HEVC/AV1 自動降到 AVC 之後；偵測不到結果時樂觀維持原排序，不影響冷啟動起播速度。
+
+**多分頁協調 / 測速機制健壯性**
+
+- 修正：多分頁互斥過去只靠 BroadcastChannel 心跳判斷「其他分頁是否在測速」，兩個分頁幾乎同時決定要測速時，心跳訊息還沒送達對方就都已經開始了，不是真正的互斥。改用 Web Locks API 做同源真互斥鎖（分頁關閉時瀏覽器自動釋放），沒有 Web Locks 的環境退回原本的心跳機制。
+- 修正：測速（賽馬 `probeCdnThroughput` 與可達性檢測 `confirmHostReachable`）過去直接用頁面的 `fetch()`，但 Tampermonkey sandbox 模式下 `window.fetch` 會轉發到被腳本自己改寫過的 `unsafeWindow.fetch`——測速請求可能被自己的攔截層改到別的節點，量出來的速度記錯到別的 CDN 頭上。現在測速改走保留下來的原生 `fetch` 參考（`rawFetch`），不受自身攔截層影響。
+- 修正：測速請求的 `referrerPolicy` 過去是 `no-referrer`，可能跟 Bilibili CDN 的防盜鏈 Referer 檢查不一致而直接被拒（403），導致賽馬永遠沒有結果卻完全沒有任何訊息。改成與頁面預設策略一致的 `strict-origin-when-cross-origin`，並新增「連續 3 輪測速全部失敗」的示警，方便使用者察覺並回報。
+- 修正：Worker 被包成 blob 載入後，`self.location` 會變成 `blob:https://...`，任何相對路徑（`./x.js`、`/api/y`）若拿 blob URL 當基準解析就會壞掉。改成先統一絕對化再判斷/改寫。同時把 module worker 載入失敗的錯誤從完全吞掉改成印出來，並把 blob URL 撤銷延遲從 30 秒延長到 5 分鐘，避免 Worker 罕見情況下需要重新讀取自己 script URL 時失敗。
+
+**設定面板 / 易用性**
+
+- 修正：Bilibili 換片是 SPA 導航，播放器常把設定面板整個重建，先前注入的 CDN 狀態面板只會注入一次，掉了就再也回不來，只能重整頁面。改成偵測到面板消失時自動就地重建。
+- 新增：Tampermonkey 選單指令（重置學習狀態、顯示診斷資訊、立即測速選節點、切換詳細記錄、HTTPDNS 狀態），不用再開 DevTools console 才能操作。
+- 新增：`BlockWebRTC` 設定開關（預設 `true`，維持原本擋 WebRTC/PCDN 的行為），需要放行的使用者現在可以自行關閉，不用改程式碼。
+
+**版本管理 / 內部清理**
+
+- 修正：版本號過去散落在 `@version`、`PluginName`、升級判斷、`GM_setValue` 四處，改版容易漏改。現在以 Tampermonkey 注入的 `GM_info.script.version` 為單一事實來源，並用語意化版本比較取代舊有的硬編碼版本白名單（原本混了 `4.4.6`~`4.7.0` 等跟本專案版本序列對不上的殘留字串）。
+- 清理：`GM_setValue(key, null)` 的用法全面改用語意更明確的 `GM_deleteValue`（新增 `@grant GM_deleteValue`）。
+- 清理：移除數個只寫不讀的死碼（`peerTabs`、`_redirectLogTs` 計數、未使用的 `totalMbps` 變數、只寫不讀的 `lastSeekAt`）。
+- 優化：`sanitizePlayInfoUrls` 對 playurl 回應的每個字串欄位都呼叫 `new URL()` 才能判斷是否為 Bilibili 影片網址，4K 多畫質/多 backup 時欄位可能有幾百個。加上長度與 `.bilivideo.` 子字串的便宜前置篩選，不改變判斷結果，只避免不必要的 `new URL()` 呼叫。
+- 優化：`Watchdog.getVideo()` 過去在每個 segment 下載完成時都重新 `querySelectorAll('video')` 掃描全文件，改成快取目前使用中的 video 元素，只有它被拔掉（換片重建播放器）才重新掃描；同時讓 `ratechange` 事件即時同步播放倍速，取代原本靠下一次 tick 才更新的做法。
+- 優化：`console.warn`/`console.error` 攔截（用來偵測 fragment 下載失敗）過去對每一則 log 都先做一次 `JSON.stringify` 才做正規表示式篩選，4K 下 console 很吵時成本不低。改成先用字串/物件淺層欄位做便宜篩選，只有確定命中才做貴的 `JSON.stringify` 補撈細節。
+- 優化：CDN 延遲探測（`probeCdnLatency`）結果快取時間從 6 小時縮短為 2 小時，網路環境變動後不會卡太久。
+
+**已知未處理項目**（這次先保留原行為，供下一版評估）
+
+- Watchdog 判定卡頓、觸發 `switchCdn()` 換節點的當下，仍會同時做「強制重建 preconnect」「立即對所有候選節點發延遲探測」「（4K 時）跑一輪賽馬」三件事，理論上會在最需要省頻寬的時刻反而多搶一手頻寬。稽核清單已有具體修正方案（只 warm 新目標、不拆現用節點的連線、延遲探測延後 10 秒），但屬於行為調整、需要實機驗證才敢動，這次先不動。
+
 ## v1.2.4
 
 **設定面板 / 相容性**

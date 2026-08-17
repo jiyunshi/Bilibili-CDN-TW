@@ -10,7 +10,7 @@
 > 實作過 `Store.get/set/del` 這層又移除，見下方說明）。
 
 - 新增：`EnableWorkerIntercept` 安全開關（工單 C 的 v1.3.2 半套）。`setupClassicWorkerIntercept()` 那 250 行程式碼保留不刪，只是開頭加了 `if (!EnableWorkerIntercept) return`；預設 `true`，行為不變。真正決定要不要整段刪除，要等 `BiliCDN.workerStats()`（v1.3.1 新增）收集到足夠真實數據後再做。
-- 新增：抽出 `pickStreamUrls` 純函式（工單 E）。原本內嵌在 `transformStreamItem` 裡判斷 dash/durl item 該用哪個候選網址的邏輯——也是 Bilibili 改版最容易壞的地方——切成不含副作用的純函式，並用 `vitest` 建立單元測試（`test/pure.test.js`，20 案例），涵蓋 `isPlayUrlApi`、`isValidCustomCdnHost`（含 `bilivideo.com.evil.com` 偽裝子網域的資安案例）、`matchesExclude`、`verGte`、`pickStreamUrls` 的 dash/durl 兩種格式。測試直接從出貨用的 `.user.js` 原始碼抽取比對，不是另外維護一份複製，避免測試跟正式程式碼漂移。
+- 重構：抽出 `pickStreamUrls` 純函式（工單 E）。原本內嵌在 `transformStreamItem` 裡判斷 dash/durl item 該用哪個候選網址的邏輯——也是 Bilibili 改版最容易壞的地方——切成不含副作用的純函式，行為完全不變，方便日後單獨檢查/除錯。（原本這次也一併建了 `vitest` 單元測試專案，事後決定不維護額外的 npm 套件與測試工具鏈，已移除 `test/`、`package.json`。）
 - 新增：`BiliCDN.report()` 診斷報告一鍵複製（工單 F）。狀態面板加「複製診斷」按鈕，組出版本、`uiInjectStatus`、白名單、黑名單、死節點、改寫統計、HTTPDNS 狀態、Worker 量測、瀏覽器 UA、頁面型態（不含 BV/ep 號）的純文字，`navigator.clipboard` 失敗時（非 HTTPS 或無使用者互動）退回印在 console。刻意不含完整影片網址、cookie、IP 等可識別使用者的資訊。
 - 撤回：曾短暫加入 `Store.get/set/del` 儲存層抽象（工單 G）把全檔 GM_* 呼叫改走這層，唯一目的是為未來擴充套件版鋪路。確認不做擴充套件版後，這層抽象沒有意義只留下多一層間接呼叫，已改回直接呼叫 `GM_getValue`/`GM_setValue`/`GM_deleteValue`，行為與改動前完全一致。
 

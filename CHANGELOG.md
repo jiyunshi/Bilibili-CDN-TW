@@ -14,6 +14,10 @@
 - 新增：`BiliCDN.report()` 診斷報告一鍵複製（工單 F）。狀態面板加「複製診斷」按鈕，組出版本、`uiInjectStatus`、白名單、黑名單、死節點、改寫統計、HTTPDNS 狀態、Worker 量測、瀏覽器 UA、頁面型態（不含 BV/ep 號）的純文字，`navigator.clipboard` 失敗時（非 HTTPS 或無使用者互動）退回印在 console。刻意不含完整影片網址、cookie、IP 等可識別使用者的資訊。
 - 撤回：曾短暫加入 `Store.get/set/del` 儲存層抽象（工單 G）把全檔 GM_* 呼叫改走這層，唯一目的是為未來擴充套件版鋪路。確認不做擴充套件版後，這層抽象沒有意義只留下多一層間接呼叫，已改回直接呼叫 `GM_getValue`/`GM_setValue`/`GM_deleteValue`，行為與改動前完全一致。
 
+**已知未處理項目**（原稽核文件《BiliCDN_TW_改進工單.md》已刪除，技術細節留存於此供未來評估）
+
+- **時段感知的 CDN 健康度**：目前 `cdnHealth`（`cdnHealth_v1` key，`CDN_HEALTH_TTL` 6 小時）只認 host，不分時段，但台灣連中國 CDN 的擁塞高度時段性（晚間尖峰 vs 凌晨差很多）。規劃方案：key 從 `host` 改為 `host|bucket`（bucket = 平日/假日 × 早/午/晚/深夜，共 8 桶），各桶各自維持 EWMA，選節點時讀當下 bucket、樣本數不足時回退跨桶平均（沿用既有 `JITTER_PRIOR_WEIGHT` 先驗機制），升級儲存 key 為 `cdnHealth_v2` 並寫一次性遷移（讀到舊 v1 資料就平均攤到所有桶當初始先驗，之後刪掉舊 key）。**沒做的原因**：會動到 `getBestCdn`/`getCdnHealthScore`/Watchdog 節點比較等即時播放路由決策的 ~15 處呼叫點，分桶會讓每桶樣本數變成原本的 1/8，先驗權重需要重新調校，這個環境沒有能力對 bilibili.com 做真實播放測試驗證調校是否正確，只能靠使用者自己拿真實用量測試一段時間才敢動。
+
 ## v1.3.1
 
 > 依《BiliCDN_TW_改進工單》執行 P0 兩項（A、B）。

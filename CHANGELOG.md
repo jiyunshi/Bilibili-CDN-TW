@@ -2,15 +2,17 @@
 
 ## v1.3.2
 
-> 依《BiliCDN_TW_改進工單》繼續執行 C（安全半套）、E、F、G。D（時段感知 CDN 健康度）
+> 依《BiliCDN_TW_改進工單》繼續執行 C（安全半套）、E、F。D（時段感知 CDN 健康度）
 > 因為要改動即時播放中決定換節點的核心評分邏輯（~15 處呼叫點），且此環境無法用
-> 真實 bilibili 流量驗證，先跳過；H（declarativeNetRequest 兜底）僅擴充套件版需要，
-> 此 repo 目前沒有擴充套件專案骨架，一併跳過。
+> 真實 bilibili 流量驗證，先跳過。工單裡原本規劃的 G（儲存層抽象）/ H
+> （declarativeNetRequest 兜底）是為了「將來出 Chrome/Edge 擴充套件版」鋪路——
+> 確認不做擴充套件版，維持單純 Tampermonkey userscript，G/H 都不採用（G 曾經短暫
+> 實作過 `Store.get/set/del` 這層又移除，見下方說明）。
 
 - 新增：`EnableWorkerIntercept` 安全開關（工單 C 的 v1.3.2 半套）。`setupClassicWorkerIntercept()` 那 250 行程式碼保留不刪，只是開頭加了 `if (!EnableWorkerIntercept) return`；預設 `true`，行為不變。真正決定要不要整段刪除，要等 `BiliCDN.workerStats()`（v1.3.1 新增）收集到足夠真實數據後再做。
 - 新增：抽出 `pickStreamUrls` 純函式（工單 E）。原本內嵌在 `transformStreamItem` 裡判斷 dash/durl item 該用哪個候選網址的邏輯——也是 Bilibili 改版最容易壞的地方——切成不含副作用的純函式，並用 `vitest` 建立單元測試（`test/pure.test.js`，20 案例），涵蓋 `isPlayUrlApi`、`isValidCustomCdnHost`（含 `bilivideo.com.evil.com` 偽裝子網域的資安案例）、`matchesExclude`、`verGte`、`pickStreamUrls` 的 dash/durl 兩種格式。測試直接從出貨用的 `.user.js` 原始碼抽取比對，不是另外維護一份複製，避免測試跟正式程式碼漂移。
 - 新增：`BiliCDN.report()` 診斷報告一鍵複製（工單 F）。狀態面板加「複製診斷」按鈕，組出版本、`uiInjectStatus`、白名單、黑名單、死節點、改寫統計、HTTPDNS 狀態、Worker 量測、瀏覽器 UA、頁面型態（不含 BV/ep 號）的純文字，`navigator.clipboard` 失敗時（非 HTTPS 或無使用者互動）退回印在 console。刻意不含完整影片網址、cookie、IP 等可識別使用者的資訊。
-- 重構：新增 `Store.get/set/del` 儲存層抽象（工單 G），全檔 42 處 `GM_getValue`/`GM_setValue`/`GM_deleteValue` 呼叫點改走這層。userscript 版本身是單純轉呼 `GM_*`，行為完全不變；這一層是為將來若要出 Chrome/Edge 擴充套件版鋪路（擴充套件版屆時另外提供 `localStorage` + `chrome.storage` 的非同步實作），此版本尚未包含擴充套件程式碼。
+- 撤回：曾短暫加入 `Store.get/set/del` 儲存層抽象（工單 G）把全檔 GM_* 呼叫改走這層，唯一目的是為未來擴充套件版鋪路。確認不做擴充套件版後，這層抽象沒有意義只留下多一層間接呼叫，已改回直接呼叫 `GM_getValue`/`GM_setValue`/`GM_deleteValue`，行為與改動前完全一致。
 
 ## v1.3.1
 

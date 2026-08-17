@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili CDN 台灣優化
 // @namespace    BiliCDN_TW
-// @version      1.3.2
+// @version      1.3.1
 // @description  改善台灣網路觀看 Bilibili 影片時的 CDN 連線穩定度，支援自動切換與卡頓監測
 // @author       jiyunshi <chocosensei214@gmail.com>
 // @license      MIT
@@ -63,7 +63,7 @@ var EnableWorkerIntercept = true
 
 // ── 版本號 ────────────────────────────────────────────────────────────
 // 單一事實來源：優先讀 Tampermonkey 注入的 GM_info（跟著 @version 走，改版不用四處手動同步）。
-const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.3.2'
+const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.3.1'
 const parseVer = (v) => String(v || '0').split('.').map(n => parseInt(n, 10) || 0)
 const verGte = (a, b) => {
     const A = parseVer(a), B = parseVer(b)
@@ -71,26 +71,14 @@ const verGte = (a, b) => {
     return true
 }
 
-// ── 儲存層抽象（改進工單 G）─────────────────────────────────────────────
-// 全檔所有 GM_getValue/GM_setValue/GM_deleteValue 呼叫都改走這層，不直接叫 GM_*。
-// 目的：未來若要出 Chrome/Edge 擴充套件版，核心邏輯（本檔其餘部分）能原封不動
-// 共用——只要另外提供一份 Store 實作（擴充套件版用 localStorage 當同步快取
-// + chrome.storage 當非同步真實來源回填；MAIN world 不能直接用 chrome.* API）。
-// userscript 版本身不需要非同步，這裡就是單純轉呼 GM_*，行為完全不變。
-const Store = {
-    get: (key) => GM_getValue(key),
-    set: (key, val) => GM_setValue(key, val),
-    del: (key) => GM_deleteValue(key),
-}
-
 // ── 診斷輸出 ──────────────────────────────────────────────────────────
 // 預設不輸出背景 log；需要排查時可在 console 執行 BiliCDN.verbose(true)。
 const PluginName = 'BiliCDN_TW_v' + VERSION
-const Config = { verbose: !!Store.get('verbose') }
+const Config = { verbose: !!GM_getValue('verbose') }
 const log = (...args) => { if (Config.verbose) console.log('[' + PluginName + ']:', ...args) }
 const err = (...args) => { if (Config.verbose) console.error('[' + PluginName + ']:', ...args) }
 
-let disabled = !!Store.get('disabled')
+let disabled = !!GM_getValue('disabled')
 
 // 面板注入狀態：預設不輸出 log（Config.verbose 只有排查時才開），如果 Bilibili
 // 改版導致 .bpx-player-ctrl-setting-others 選擇器失效，使用者不會看到任何錯誤，
@@ -175,10 +163,10 @@ const CDN_HEALTH_TTL = 6 * 60 * 60 * 1000
 
 const blacklistSet = (() => {
     try {
-        const raw   = JSON.parse(Store.get('cdnBlacklist') || '[]')
+        const raw   = JSON.parse(GM_getValue('cdnBlacklist') || '[]')
         const now   = Date.now()
         const valid = raw.filter(e => e && e.cdn && e.expireAt > now)
-        if (valid.length !== raw.length) Store.set('cdnBlacklist', JSON.stringify(valid))
+        if (valid.length !== raw.length) GM_setValue('cdnBlacklist', JSON.stringify(valid))
         return new Set(valid.map(e => e.cdn))
     } catch {
         return new Set()
@@ -193,10 +181,10 @@ const DEAD_HOSTS_TTL = 7 * 24 * 60 * 60 * 1000
 
 const knownDeadHosts = (() => {
     try {
-        const raw   = JSON.parse(Store.get(DEAD_HOSTS_KEY) || '[]')
+        const raw   = JSON.parse(GM_getValue(DEAD_HOSTS_KEY) || '[]')
         const now   = Date.now()
         const valid = raw.filter(e => e && e.host && e.expireAt > now)
-        if (valid.length !== raw.length) Store.set(DEAD_HOSTS_KEY, JSON.stringify(valid))
+        if (valid.length !== raw.length) GM_setValue(DEAD_HOSTS_KEY, JSON.stringify(valid))
         return new Set(valid.map(e => e.host))
     } catch {
         return new Set()
@@ -206,18 +194,18 @@ const knownDeadHosts = (() => {
 // 升級/首次安裝：清掉舊黑名單+probe 快取，標記需要重新墊底排序預設台灣節點
 let shouldSeedInitialHosts = false
 try {
-    const installedVersion = Store.get('blicdnVersion')
+    const installedVersion = GM_getValue('blicdnVersion')
     if (installedVersion !== VERSION) {
         // 1.1.0+ 改用實測下載速度挑節點；舊 probe 快取是延遲排序，一律清掉重學
-        Store.del('probeCache_v1')
+        GM_deleteValue('probeCache_v1')
         // 舊版殘留的 '4.4.6'..'4.7.0' 字串跟本專案 1.x 版本序列對不上（疑似複製自其他腳本），
         // 一律視為「≥1.0.0 就是安全版本」：用語意化比較取代硬編碼清單。
         if (!installedVersion || !verGte(installedVersion, '1.0.0')) {
-            Store.set('cdnBlacklist', '[]')
-            Store.del('probeCache_v1')
+            GM_setValue('cdnBlacklist', '[]')
+            GM_deleteValue('probeCache_v1')
             shouldSeedInitialHosts = true
         }
-        Store.set('blicdnVersion', VERSION)
+        GM_setValue('blicdnVersion', VERSION)
     }
 } catch {}
 
@@ -225,11 +213,11 @@ const markHostDead = (host, reason) => {
     if (!host || knownDeadHosts.has(host)) return
     knownDeadHosts.add(host)
     try {
-        const raw    = JSON.parse(Store.get(DEAD_HOSTS_KEY) || '[]')
+        const raw    = JSON.parse(GM_getValue(DEAD_HOSTS_KEY) || '[]')
         const now    = Date.now()
         const others = raw.filter(e => e && e.host !== host && e.expireAt > now)
         others.push({ host, expireAt: now + DEAD_HOSTS_TTL, reason: reason || 'unknown' })
-        Store.set(DEAD_HOSTS_KEY, JSON.stringify(others))
+        GM_setValue(DEAD_HOSTS_KEY, JSON.stringify(others))
     } catch {}
     const idx = activeCdnList.indexOf(host)
     if (idx !== -1) activeCdnList.splice(idx, 1)
@@ -237,7 +225,7 @@ const markHostDead = (host, reason) => {
 
 const clearDeadHosts = () => {
     knownDeadHosts.clear()
-    try { Store.set(DEAD_HOSTS_KEY, '[]') } catch {}
+    try { GM_setValue(DEAD_HOSTS_KEY, '[]') } catch {}
     PREFERRED_CDN_LIST.forEach(c => {
         if (!activeCdnList.includes(c) && !blacklistSet.has(c)) activeCdnList.push(c)
     })
@@ -256,11 +244,11 @@ const addToBlacklist = (cdn) => {
     const idx = activeCdnList.indexOf(cdn)
     if (idx !== -1) activeCdnList.splice(idx, 1)
     try {
-        const raw    = JSON.parse(Store.get('cdnBlacklist') || '[]')
+        const raw    = JSON.parse(GM_getValue('cdnBlacklist') || '[]')
         const now    = Date.now()
         const others = raw.filter(e => e && e.cdn !== cdn && e.expireAt > now)
         others.push({ cdn, expireAt: now + BLACKLIST_EXPIRE_MS })
-        Store.set('cdnBlacklist', JSON.stringify(others))
+        GM_setValue('cdnBlacklist', JSON.stringify(others))
     } catch {}
 }
 
@@ -271,7 +259,7 @@ const clearBlacklist = () => {
         if (!activeCdnList.includes(c)) activeCdnList.push(c)
     })
     activeCdnList.sort((a, b) => PREFERRED_CDN_LIST.indexOf(a) - PREFERRED_CDN_LIST.indexOf(b))
-    try { Store.set('cdnBlacklist', '[]') } catch {}
+    try { GM_setValue('cdnBlacklist', '[]') } catch {}
     log('[黑名單] 已全部清除，所有白名單節點重新啟用')
 }
 
@@ -282,7 +270,7 @@ const cdnSoftBlockUntil = {}
 // 實際 segment 吞吐評分：probe 只決定初始順序，播放後改由真實下載速度接管。
 const cdnHealth = (() => {
     try {
-        const raw = JSON.parse(Store.get(CDN_HEALTH_KEY) || '{}')
+        const raw = JSON.parse(GM_getValue(CDN_HEALTH_KEY) || '{}')
         const now = Date.now()
         const out = {}
         Object.entries(raw).forEach(([cdn, h]) => {
@@ -335,7 +323,7 @@ const scheduleCdnHealthSave = () => {
             // 多分頁共用 GM 儲存：先讀回其他分頁可能已寫入的最新資料，逐 CDN 以 lastSeen
             // 較新者為準合併，避免分頁互相覆寫造成跨分頁學習丟失。
             let stored = {}
-            try { stored = JSON.parse(Store.get(CDN_HEALTH_KEY) || '{}') || {} } catch {}
+            try { stored = JSON.parse(GM_getValue(CDN_HEALTH_KEY) || '{}') || {} } catch {}
             const payload = {}
             const allCdns = new Set([...Object.keys(stored), ...Object.keys(cdnHealth)])
             allCdns.forEach(cdn => {
@@ -360,7 +348,7 @@ const scheduleCdnHealthSave = () => {
                     lastSlowAt: +pick.lastSlowAt || 0,
                 }
             })
-            Store.set(CDN_HEALTH_KEY, JSON.stringify(payload))
+            GM_setValue(CDN_HEALTH_KEY, JSON.stringify(payload))
         } catch {}
     }, 1000)
 }
@@ -755,13 +743,13 @@ const promoteBestCdnNow = () => {
 // 解析固定 CDN（CustomCDN 變數 vs GM 儲存）
 const resolvedCdn = (() => {
     if (CustomCDN === 'null') CustomCDN = null
-    const stored = Store.get('CustomCDN')
+    const stored = GM_getValue('CustomCDN')
     let domain
     if (CustomCDN) {
         domain = CustomCDN
-        if (CustomCDN !== stored) Store.set('CustomCDN', domain)
+        if (CustomCDN !== stored) GM_setValue('CustomCDN', domain)
     } else if (CustomCDN === null && stored !== null) {
-        Store.del('CustomCDN')
+        GM_deleteValue('CustomCDN')
     } else {
         domain = stored || null
     }
@@ -1026,7 +1014,7 @@ const HttpDnsAutoPilot = (() => {
     const loadProfile = () => {
         const networkKey = getNetworkKey()
         try {
-            const raw = JSON.parse(Store.get(HTTPDNS_PROFILE_KEY) || '{}')
+            const raw = JSON.parse(GM_getValue(HTTPDNS_PROFILE_KEY) || '{}')
             if (raw.networkKey === networkKey && (Date.now() - (raw.updatedAt || 0)) < HTTPDNS_PROFILE_TTL) {
                 return raw
             }
@@ -1039,12 +1027,12 @@ const HttpDnsAutoPilot = (() => {
     const saveProfile = () => {
         profile.updatedAt = Date.now()
         profile.networkKey = getNetworkKey()
-        try { Store.set(HTTPDNS_PROFILE_KEY, JSON.stringify(profile)) } catch {}
+        try { GM_setValue(HTTPDNS_PROFILE_KEY, JSON.stringify(profile)) } catch {}
     }
 
     const loadAutoState = () => {
         try {
-            const raw = JSON.parse(Store.get(HTTPDNS_STATE_KEY) || '{}')
+            const raw = JSON.parse(GM_getValue(HTTPDNS_STATE_KEY) || '{}')
             return {
                 phase:           raw.phase || 'none',
                 allowUntil:      Number(raw.allowUntil) || 0,
@@ -1061,7 +1049,7 @@ const HttpDnsAutoPilot = (() => {
     let autoState = loadAutoState()
 
     const saveAutoState = () => {
-        try { Store.set(HTTPDNS_STATE_KEY, JSON.stringify(autoState)) } catch {}
+        try { GM_setValue(HTTPDNS_STATE_KEY, JSON.stringify(autoState)) } catch {}
     }
 
     // 進入 trial-allow 時記錄 watchdog 累計快照，
@@ -1132,7 +1120,7 @@ const HttpDnsAutoPilot = (() => {
         }
         redirectStats.httpdnsAutoSwitch++
         saveAutoState()
-        try { Store.del(PROBE_CACHE_KEY) } catch {}
+        try { GM_deleteValue(PROBE_CACHE_KEY) } catch {}
     }
 
     const endTrialAllow = (reason, sample) => {
@@ -2081,7 +2069,7 @@ const WORKER_STATS_SAVE_MS = 5000
 const WORKER_STATS_MAX_SAMPLES = 5
 const workerStats = (() => {
     try {
-        const raw = JSON.parse(Store.get(WORKER_STATS_KEY) || '{}') || {}
+        const raw = JSON.parse(GM_getValue(WORKER_STATS_KEY) || '{}') || {}
         return {
             created: +raw.created || 0,
             netCalls: +raw.netCalls || 0,
@@ -2099,7 +2087,7 @@ const workerStats = (() => {
 let workerStatsSaveTimer = null
 const flushWorkerStats = () => {
     if (workerStatsSaveTimer) { clearTimeout(workerStatsSaveTimer); workerStatsSaveTimer = null }
-    try { Store.set(WORKER_STATS_KEY, JSON.stringify(workerStats)) } catch {}
+    try { GM_setValue(WORKER_STATS_KEY, JSON.stringify(workerStats)) } catch {}
 }
 const scheduleWorkerStatsSave = () => {
     if (workerStatsSaveTimer) return
@@ -2806,7 +2794,7 @@ const doBakeoff = async (sampleUrl) => {
         }
 
         promoteBestCdnNow()
-        try { Store.set(PROBE_CACHE_KEY, JSON.stringify({ t: Date.now(), list: [...activeCdnList] })) } catch {}
+        try { GM_setValue(PROBE_CACHE_KEY, JSON.stringify({ t: Date.now(), list: [...activeCdnList] })) } catch {}
     } finally {
         bakeoffRunning = false
         if (bakeoffAbortController && bakeoffAbortController.signal === mySignal) bakeoffAbortController = null
@@ -2979,7 +2967,7 @@ const reorderCdnsByLatency = async (force) => {
         // Cache hit → 完全不發探測請求
         if (!force) {
             try {
-                const cached = JSON.parse(Store.get(PROBE_CACHE_KEY) || 'null')
+                const cached = JSON.parse(GM_getValue(PROBE_CACHE_KEY) || 'null')
                 if (cached && (Date.now() - cached.t) < PROBE_CACHE_TTL && Array.isArray(cached.list)) {
                     activeCdnList.length = 0
                     cached.list.forEach(c => {
@@ -3023,7 +3011,7 @@ const reorderCdnsByLatency = async (force) => {
         }
 
         try {
-            Store.set(PROBE_CACHE_KEY, JSON.stringify({ t: Date.now(), list: [...activeCdnList] }))
+            GM_setValue(PROBE_CACHE_KEY, JSON.stringify({ t: Date.now(), list: [...activeCdnList] }))
         } catch {}
 
         if (activeCdnList[0]) {
@@ -3178,7 +3166,7 @@ const Watchdog = (() => {
             log('[Watchdog] 切換觸發：' + reason + '，懲罰 ' + culprit.split('.')[0])
         }
 
-        try { Store.del(PROBE_CACHE_KEY) } catch {}
+        try { GM_deleteValue(PROBE_CACHE_KEY) } catch {}
         promoteBestCdnNow()
         // 卡頓當下要搶頻寬給「新目標」熱身，但不能連帶拆掉現用節點的連線：
         // preconnectCdn(force=true) 會 remove() 舊 <link> 再重建，讓瀏覽器有機會回收那條
@@ -3575,7 +3563,7 @@ unsafeWindow.BiliCDN = {
             return Config.verbose
         }
         Config.verbose = on
-        try { Store.set('verbose', on) } catch {}
+        try { GM_setValue('verbose', on) } catch {}
         console.log('[BiliCDN] Verbose =', on, '（已持久化）')
         return on
     },
@@ -3588,7 +3576,7 @@ unsafeWindow.BiliCDN = {
         clearDeadHosts()
         Object.keys(cdnFailCount).forEach(k => delete cdnFailCount[k])
         Object.keys(cdnHealth).forEach(k => delete cdnHealth[k])
-        try { Store.set(CDN_HEALTH_KEY, '{}') } catch {}
+        try { GM_setValue(CDN_HEALTH_KEY, '{}') } catch {}
         lastChosenCdn = null
         Object.assign(redirectStats, {
             unstable: 0,
@@ -3600,7 +3588,7 @@ unsafeWindow.BiliCDN = {
         })
         HttpDnsAutoPilot.reset()
         pageDiscoveredCdn = null
-        try { Store.del(PROBE_CACHE_KEY) } catch {}
+        try { GM_deleteValue(PROBE_CACHE_KEY) } catch {}
         Watchdog.reset()
         log('已重置：黑名單、軟隔離、持久死節點、失敗計數、健康分數、probe 快取、改寫統計、Watchdog')
         return this.diag()
@@ -3642,7 +3630,7 @@ unsafeWindow.BiliCDN = {
     },
     dead() {
         try {
-            const raw = JSON.parse(Store.get(DEAD_HOSTS_KEY) || '[]')
+            const raw = JSON.parse(GM_getValue(DEAD_HOSTS_KEY) || '[]')
             console.group('[BiliCDN] 持久死節點清單')
             raw.forEach(e => {
                 const leftMs = e.expireAt - Date.now()
@@ -3654,12 +3642,12 @@ unsafeWindow.BiliCDN = {
         } catch { return [] }
     },
     setCdn(host) {
-        if (!host) { Store.del('CustomCDN'); log('已清除固定 CDN（重整生效）'); return }
+        if (!host) { GM_deleteValue('CustomCDN'); log('已清除固定 CDN（重整生效）'); return }
         if (!isValidCustomCdnHost(host)) {
             err('[安全] 拒絕設定：「' + host + '」不是合法的 bilibili CDN 網域格式（需為 *.bilivideo.com 或 *.bilivideo.cn）')
             return
         }
-        Store.set('CustomCDN', host)
+        GM_setValue('CustomCDN', host)
         log('已固定 CDN 為 ' + host + '（重整頁面生效）')
     },
     buf() {
@@ -3695,7 +3683,7 @@ unsafeWindow.BiliCDN = {
         for (let i = activeCdnList.length - 1; i >= 0; i--) {
             if (activeCdnList[i].indexOf(kw) !== -1) activeCdnList.splice(i, 1)
         }
-        try { Store.del(PROBE_CACHE_KEY) } catch {}
+        try { GM_deleteValue(PROBE_CACHE_KEY) } catch {}
         log('已加入排除：' + kw + '，剩餘：'
             + activeCdnList.map(c => c.split('.')[0]).join(', '))
         return [...ExcludeHostKeywords]
@@ -3710,7 +3698,7 @@ unsafeWindow.BiliCDN = {
             if (matchesExclude(h)) return
             if (!activeCdnList.includes(h) && !blacklistSet.has(h)) activeCdnList.push(h)
         })
-        try { Store.del(PROBE_CACHE_KEY) } catch {}
+        try { GM_deleteValue(PROBE_CACHE_KEY) } catch {}
         log('已移除排除：' + kw + '，當前：'
             + activeCdnList.map(c => c.split('.')[0]).join(', '))
         return [...ExcludeHostKeywords]
@@ -4104,7 +4092,7 @@ if (typeof GM_registerMenuCommand === 'function') {
         checkBox.checked = !disabled
         checkBox.addEventListener('change', () => {
             disabled = !checkBox.checked
-            Store.set('disabled', disabled)
+            GM_setValue('disabled', disabled)
             if (disabled) stopRuntimeFeatures()
             else startRuntimeFeatures()
             syncWorkerDisabledState()

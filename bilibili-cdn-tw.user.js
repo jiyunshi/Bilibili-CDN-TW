@@ -3396,6 +3396,65 @@ const Watchdog = (() => {
     }
 })()
 
+// 頁面型態（改進工單 F 用）：只取路徑的類別區段（video/bangumi/play/cheese...），
+// 不含 BV 號、ep 號等具體影片識別碼。
+const getPageTypeLabel = () => {
+    const path = location.pathname
+    const m = path.match(/^\/([a-z]+)(?:\/([a-z]+))?/)
+    if (!m) return path || '/'
+    return '/' + [m[1], m[2]].filter(Boolean).join('/')
+}
+
+// 診斷報告一鍵複製（改進工單 F）：組出一段純文字讓使用者回報問題時直接貼上，省掉
+// 來回追問版本/狀態的往返。刻意只放 host 與統計數字——不含完整影片網址、cookie、
+// IP 等任何可識別使用者身分或觀看紀錄的資訊。
+const buildDiagReport = () => {
+    const ws = summarizeWorkerStats()
+    const httpDns = getHttpDnsStatus()
+    const lines = [
+        '[BiliCDN_TW 診斷報告]',
+        '版本：' + VERSION,
+        '頁面型態：' + getPageTypeLabel(),
+        'UA：' + navigator.userAgent,
+        '面板注入狀態：' + uiInjectStatus,
+        '停用狀態：' + disabled,
+        'Worker 攔截開關：' + EnableWorkerIntercept,
+        '白名單：' + (activeCdnList.map(c => c.split('.')[0]).join(' > ') || '（無）'),
+        '黑名單（24h）：' + ([...blacklistSet].map(c => c.split('.')[0]).join(', ') || '（無）'),
+        '持久死節點（7d）：' + ([...knownDeadHosts].map(c => c.split('.')[0]).join(', ') || '（無）'),
+        '目前最佳：' + getCdnShortName(),
+        '頁面發現 CDN：' + (pageDiscoveredCdn ? pageDiscoveredCdn.split('.')[0] : '（無）'),
+        '改寫統計：' + JSON.stringify(redirectStats),
+        'HTTPDNS：' + httpDns.mode + (httpDns.ttlMin ? '（' + httpDns.ttlMin + 'm）' : ''),
+        'Worker 量測：created=' + ws.created + ' netCalls=' + ws.netCalls + ' mediaSeen=' + ws.mediaSeen
+            + ' rewrites=' + ws.rewrites + ' 觀察' + ws.observedDays + '天 判讀=' + ws.verdict,
+    ]
+    return lines.join('\n')
+}
+
+// 剪貼簿 API 在非 HTTPS 或非使用者互動觸發時會失敗（例如純用 console 呼叫 BiliCDN.report()
+// 而非點面板按鈕），失敗時退回印在 console，讓使用者手動選取複製。
+const copyDiagReport = () => {
+    const text = buildDiagReport()
+    const fallback = (e) => {
+        console.log(text)
+        console.log('[BiliCDN] 剪貼簿複製失敗' + (e ? '（' + e.message + '）' : '（非 HTTPS 或無使用者互動）')
+            + '，診斷內容已印在上面，手動選取複製即可。')
+    }
+    try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(() => {
+                log('[診斷報告] 已複製到剪貼簿')
+            }).catch(fallback)
+        } else {
+            fallback()
+        }
+    } catch (e) {
+        fallback(e)
+    }
+    return text
+}
+
 // ── 診斷 API（在 console 用：BiliCDN.diag() / .verbose(true) 等）────────
 unsafeWindow.BiliCDN = {
     diag() {
@@ -3464,6 +3523,13 @@ unsafeWindow.BiliCDN = {
         console.log('判讀:', s.verdict)
         console.groupEnd()
         return s
+    },
+    // 診斷報告一鍵複製（改進工單 F）：回報問題時直接貼給開發者，省掉來回追問。
+    // 不含完整影片網址／cookie／IP，只有 host 與統計數字。
+    report() {
+        const text = copyDiagReport()
+        console.log(text)
+        return text
     },
     stats() {
         console.log('[BiliCDN] 改寫統計:', redirectStats,
@@ -4052,6 +4118,15 @@ if (typeof GM_registerMenuCommand === 'function') {
                     updateStatusPanel()
                 })
             }
+            const reportBtn = statusPanel.querySelector('#bilicdn-report-btn')
+            if (reportBtn) {
+                reportBtn.addEventListener('click', (e) => {
+                    e.stopPropagation()
+                    copyDiagReport()
+                    reportBtn.textContent = '已複製診斷 ✓'
+                    setTimeout(() => { if (document.contains(reportBtn)) reportBtn.textContent = '複製診斷' }, 1500)
+                })
+            }
         }
 
         const updateStatusPanel = () => {
@@ -4117,6 +4192,7 @@ if (typeof GM_registerMenuCommand === 'function') {
             if (pageDiscoveredCdn) {
                 html += '<div style="color:#9e9e9e;font-size:9px;">頁面 CDN：' + pageDiscoveredCdn.split('.')[0] + '</div>'
             }
+            html += '<div style="margin-top:2px;"><span id="bilicdn-report-btn" style="cursor:pointer;color:#4fc3f7;text-decoration:underline;">複製診斷</span></div>'
 
             renderStatusHtml(html)
         }

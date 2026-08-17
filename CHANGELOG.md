@@ -17,6 +17,7 @@
 **已知未處理項目**（原稽核文件《BiliCDN_TW_改進工單.md》已刪除，技術細節留存於此供未來評估）
 
 - **時段感知的 CDN 健康度**：目前 `cdnHealth`（`cdnHealth_v1` key，`CDN_HEALTH_TTL` 6 小時）只認 host，不分時段，但台灣連中國 CDN 的擁塞高度時段性（晚間尖峰 vs 凌晨差很多）。規劃方案：key 從 `host` 改為 `host|bucket`（bucket = 平日/假日 × 早/午/晚/深夜，共 8 桶），各桶各自維持 EWMA，選節點時讀當下 bucket、樣本數不足時回退跨桶平均（沿用既有 `JITTER_PRIOR_WEIGHT` 先驗機制），升級儲存 key 為 `cdnHealth_v2` 並寫一次性遷移（讀到舊 v1 資料就平均攤到所有桶當初始先驗，之後刪掉舊 key）。**沒做的原因**：會動到 `getBestCdn`/`getCdnHealthScore`/Watchdog 節點比較等即時播放路由決策的 ~15 處呼叫點，分桶會讓每桶樣本數變成原本的 1/8，先驗權重需要重新調校，這個環境沒有能力對 bilibili.com 做真實播放測試驗證調校是否正確，只能靠使用者自己拿真實用量測試一段時間才敢動。
+- **（替代/補充方案）網路環境感知的 CDN 健康度**：2026-08-17 重新審視選路架構時發現，`HttpDnsAutoPilot` 已經有一套「網路環境指紋」`getNetworkKey()`（時區 + 語言 + `navigator.connection` 的 `effectiveType` + `downlink`）用來記住「這個網路環境該不該擋 HTTPDNS」，但決定選哪個 CDN 的 `cdnHealth` 完全沒用到同一招，純粹用 host 當 key。换 WiFi/用 VPN 對 CDN 路由現實的影響，理論上比單純時段更直接、更有因果關係，可以考慮把 `cdnHealth` 的 key 也比照 `getNetworkKey()` 分維度，當作上面「時段感知」方案的替代或補充。**風險與時段方案完全相同**（同一組即時路由呼叫點、需要真實流量驗證調校），一併留到之後真的要動這塊時再評估，不是現在就要做的待辦。
 
 ## v1.3.1
 

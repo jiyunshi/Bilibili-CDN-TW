@@ -1,30 +1,24 @@
 # Changelog
 
-## v1.3.2
+## v1.3.1
 
-> 依《BiliCDN_TW_改進工單》繼續執行 C（安全半套）、E、F。D（時段感知 CDN 健康度）
-> 因為要改動即時播放中決定換節點的核心評分邏輯（~15 處呼叫點），且此環境無法用
-> 真實 bilibili 流量驗證，先跳過。工單裡原本規劃的 G（儲存層抽象）/ H
+> 依《BiliCDN_TW_改進工單》執行 A、B（P0）、C（安全半套）、E、F。D（時段感知 CDN
+> 健康度）因為要改動即時播放中決定換節點的核心評分邏輯（~15 處呼叫點），且此環境
+> 無法用真實 bilibili 流量驗證，先跳過。工單裡原本規劃的 G（儲存層抽象）/ H
 > （declarativeNetRequest 兜底）是為了「將來出 Chrome/Edge 擴充套件版」鋪路——
-> 確認不做擴充套件版，維持單純 Tampermonkey userscript，G/H 都不採用（G 曾經短暫
-> 實作過 `Store.get/set/del` 這層又移除，見下方說明）。
+> 確認不做擴充套件版，維持單純 Tampermonkey userscript，G/H 都不採用（G 開發過程中
+> 曾短暫實作過 `Store.get/set/del` 這層，確認方向後隨即移除，未曾對外發布）。
 
-- 新增：`EnableWorkerIntercept` 安全開關（工單 C 的 v1.3.2 半套）。`setupClassicWorkerIntercept()` 那 250 行程式碼保留不刪，只是開頭加了 `if (!EnableWorkerIntercept) return`；預設 `true`，行為不變。真正決定要不要整段刪除，要等 `BiliCDN.workerStats()`（v1.3.1 新增）收集到足夠真實數據後再做。
-- 重構：抽出 `pickStreamUrls` 純函式（工單 E）。原本內嵌在 `transformStreamItem` 裡判斷 dash/durl item 該用哪個候選網址的邏輯——也是 Bilibili 改版最容易壞的地方——切成不含副作用的純函式，行為完全不變，方便日後單獨檢查/除錯。（原本這次也一併建了 `vitest` 單元測試專案，事後決定不維護額外的 npm 套件與測試工具鏈，已移除 `test/`、`package.json`。）
-- 新增：`BiliCDN.report()` 診斷報告一鍵複製（工單 F）。狀態面板加「複製診斷」按鈕，組出版本、`uiInjectStatus`、白名單、黑名單、死節點、改寫統計、HTTPDNS 狀態、Worker 量測、瀏覽器 UA、頁面型態（不含 BV/ep 號）的純文字，`navigator.clipboard` 失敗時（非 HTTPS 或無使用者互動）退回印在 console。刻意不含完整影片網址、cookie、IP 等可識別使用者的資訊。
-- 撤回：曾短暫加入 `Store.get/set/del` 儲存層抽象（工單 G）把全檔 GM_* 呼叫改走這層，唯一目的是為未來擴充套件版鋪路。確認不做擴充套件版後，這層抽象沒有意義只留下多一層間接呼叫，已改回直接呼叫 `GM_getValue`/`GM_setValue`/`GM_deleteValue`，行為與改動前完全一致。
+- 修正：UI 注入的自我修復機制（`statusTimer`）宣告在 `buildUI` 內部，若第一次 `waitForElm` 等待設定面板錨點就逾時（網路慢、番劇頁載入久），`buildUI` 從未執行過，`statusTimer` 也就從未誕生，狀態面板會永遠不出現，且預設不開 verbose 的使用者完全看不到任何錯誤。改成在檔案結尾新增一顆獨立的常駐看門狗 `ensureUiPresent`（每 1.5 秒檢查一次），不受初次逾時影響持續重試找錨點建面板；原本 `buildUI` 內的 `statusTimer` 專心負責「面板健在時的內容刷新」與「偵測到新面板出現時自我了斷」，兩套機制不會重複建面板。
+- 新增：Worker 攔截有效性量測（`BiliCDN.workerStats()`）。`setupClassicWorkerIntercept()` 這 250 行是全檔最複雜脆弱的部分，且不確定播放器是否真的用 Worker 抓影片分段。埋入 `created`（攔到幾次 `new Worker`）→ `netCalls`（Worker 內發出幾次網路請求）→ `mediaSeen`（其中幾次是影片分段）→ `rewrites`（實際改寫幾次）四個分層指標，持久化在本機（`GM_setValue`，5 秒 debounce + `pagehide` 時強制 flush），`BiliCDN.diag()` 一併顯示已觀察天數與判讀建議。所有計數只存在使用者本機，腳本不會自動上傳任何資料，回報完全靠使用者手動複製貼上——用真實數據決定這段程式碼未來的去留。
+- 新增：`EnableWorkerIntercept` 安全開關。`setupClassicWorkerIntercept()` 那 250 行程式碼保留不刪，只是開頭加了 `if (!EnableWorkerIntercept) return`；預設 `true`，行為不變。真正決定要不要整段刪除，要等 `BiliCDN.workerStats()` 收集到足夠真實數據後再做。
+- 重構：抽出 `pickStreamUrls` 純函式。原本內嵌在 `transformStreamItem` 裡判斷 dash/durl item 該用哪個候選網址的邏輯——也是 Bilibili 改版最容易壞的地方——切成不含副作用的純函式，行為完全不變，方便日後單獨檢查/除錯。
+- 新增：`BiliCDN.report()` 診斷報告一鍵複製。狀態面板加「複製診斷」按鈕，組出版本、`uiInjectStatus`、白名單、黑名單、死節點、改寫統計、HTTPDNS 狀態、Worker 量測、瀏覽器 UA、頁面型態（不含 BV/ep 號）的純文字，`navigator.clipboard` 失敗時（非 HTTPS 或無使用者互動）退回印在 console。刻意不含完整影片網址、cookie、IP 等可識別使用者的資訊。
 
 **已知未處理項目**（原稽核文件《BiliCDN_TW_改進工單.md》已刪除，技術細節留存於此供未來評估）
 
 - **時段感知的 CDN 健康度**：目前 `cdnHealth`（`cdnHealth_v1` key，`CDN_HEALTH_TTL` 6 小時）只認 host，不分時段，但台灣連中國 CDN 的擁塞高度時段性（晚間尖峰 vs 凌晨差很多）。規劃方案：key 從 `host` 改為 `host|bucket`（bucket = 平日/假日 × 早/午/晚/深夜，共 8 桶），各桶各自維持 EWMA，選節點時讀當下 bucket、樣本數不足時回退跨桶平均（沿用既有 `JITTER_PRIOR_WEIGHT` 先驗機制），升級儲存 key 為 `cdnHealth_v2` 並寫一次性遷移（讀到舊 v1 資料就平均攤到所有桶當初始先驗，之後刪掉舊 key）。**沒做的原因**：會動到 `getBestCdn`/`getCdnHealthScore`/Watchdog 節點比較等即時播放路由決策的 ~15 處呼叫點，分桶會讓每桶樣本數變成原本的 1/8，先驗權重需要重新調校，這個環境沒有能力對 bilibili.com 做真實播放測試驗證調校是否正確，只能靠使用者自己拿真實用量測試一段時間才敢動。
 - **（替代/補充方案）網路環境感知的 CDN 健康度**：2026-08-17 重新審視選路架構時發現，`HttpDnsAutoPilot` 已經有一套「網路環境指紋」`getNetworkKey()`（時區 + 語言 + `navigator.connection` 的 `effectiveType` + `downlink`）用來記住「這個網路環境該不該擋 HTTPDNS」，但決定選哪個 CDN 的 `cdnHealth` 完全沒用到同一招，純粹用 host 當 key。换 WiFi/用 VPN 對 CDN 路由現實的影響，理論上比單純時段更直接、更有因果關係，可以考慮把 `cdnHealth` 的 key 也比照 `getNetworkKey()` 分維度，當作上面「時段感知」方案的替代或補充。**風險與時段方案完全相同**（同一組即時路由呼叫點、需要真實流量驗證調校），一併留到之後真的要動這塊時再評估，不是現在就要做的待辦。
-
-## v1.3.1
-
-> 依《BiliCDN_TW_改進工單》執行 P0 兩項（A、B）。
-
-- 修正：UI 注入的自我修復機制（`statusTimer`）宣告在 `buildUI` 內部，若第一次 `waitForElm` 等待設定面板錨點就逾時（網路慢、番劇頁載入久），`buildUI` 從未執行過，`statusTimer` 也就從未誕生，狀態面板會永遠不出現，且預設不開 verbose 的使用者完全看不到任何錯誤。改成在檔案結尾新增一顆獨立的常駐看門狗 `ensureUiPresent`（每 1.5 秒檢查一次），不受初次逾時影響持續重試找錨點建面板；原本 `buildUI` 內的 `statusTimer` 專心負責「面板健在時的內容刷新」與「偵測到新面板出現時自我了斷」，兩套機制不會重複建面板。
-- 新增：Worker 攔截有效性量測（`BiliCDN.workerStats()`）。`setupClassicWorkerIntercept()` 這 250 行是全檔最複雜脆弱的部分，且不確定播放器是否真的用 Worker 抓影片分段。埋入 `created`（攔到幾次 `new Worker`）→ `netCalls`（Worker 內發出幾次網路請求）→ `mediaSeen`（其中幾次是影片分段）→ `rewrites`（實際改寫幾次）四個分層指標，持久化在本機（`GM_setValue`，5 秒 debounce + `pagehide` 時強制 flush），`BiliCDN.diag()` 一併顯示已觀察天數與判讀建議。所有計數只存在使用者本機，腳本不會自動上傳任何資料，回報完全靠使用者手動複製貼上——用真實數據決定這段程式碼未來的去留（工單 C）。
 
 ## v1.3.0
 

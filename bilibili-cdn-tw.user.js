@@ -2183,10 +2183,10 @@ const syncWorkerDisabledState = () => {
 }
 
 const setupClassicWorkerIntercept = () => {
-    // 改進工單 C：安全開關（v1.3.2 半套）。關閉時整段攔截機制不生效，biliCdnWorkers
+    // 安全開關。關閉時整段攔截機制不生效，biliCdnWorkers
     // 維持空 Set——syncWorkerCdnTarget()/syncWorkerDisabledState() 的 forEach 在空 Set
-    // 上單純不做事，不會因為開關關閉而丟例外。程式碼刻意保留不刪，等改進工單 B 的
-    // workerStats() 數據確認這段真的沒用後，才在未來版本整段移除（見 CHANGELOG）。
+    // 上單純不做事，不會因為開關關閉而丟例外。程式碼刻意保留不刪，等 workerStats()
+    // 數據確認這段真的沒用後，才在未來版本整段移除（見 CHANGELOG）。
     if (!EnableWorkerIntercept) return
     try {
         const OriginalWorker = unsafeWindow.Worker

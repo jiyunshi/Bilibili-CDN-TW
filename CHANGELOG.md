@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.3.1
+
+> 依《BiliCDN_TW_改進工單》執行 P0 兩項（A、B）。
+
+- 修正：UI 注入的自我修復機制（`statusTimer`）宣告在 `buildUI` 內部，若第一次 `waitForElm` 等待設定面板錨點就逾時（網路慢、番劇頁載入久），`buildUI` 從未執行過，`statusTimer` 也就從未誕生，狀態面板會永遠不出現，且預設不開 verbose 的使用者完全看不到任何錯誤。改成在檔案結尾新增一顆獨立的常駐看門狗 `ensureUiPresent`（每 1.5 秒檢查一次），不受初次逾時影響持續重試找錨點建面板；原本 `buildUI` 內的 `statusTimer` 專心負責「面板健在時的內容刷新」與「偵測到新面板出現時自我了斷」，兩套機制不會重複建面板。
+- 新增：Worker 攔截有效性量測（`BiliCDN.workerStats()`）。`setupClassicWorkerIntercept()` 這 250 行是全檔最複雜脆弱的部分，且不確定播放器是否真的用 Worker 抓影片分段。埋入 `created`（攔到幾次 `new Worker`）→ `netCalls`（Worker 內發出幾次網路請求）→ `mediaSeen`（其中幾次是影片分段）→ `rewrites`（實際改寫幾次）四個分層指標，持久化在本機（`GM_setValue`，5 秒 debounce + `pagehide` 時強制 flush），`BiliCDN.diag()` 一併顯示已觀察天數與判讀建議。所有計數只存在使用者本機，腳本不會自動上傳任何資料，回報完全靠使用者手動複製貼上——用真實數據決定這段程式碼未來的去留（工單 C）。
+
 ## v1.3.0
 
 > 本版全面對照 v1.2.4 逐項稽核結果（3 項 P0、7 項 P1、9 項 P2、10 項 P3，共 29 項）落地修正，共處理 27/29 項。以下依主題分類。

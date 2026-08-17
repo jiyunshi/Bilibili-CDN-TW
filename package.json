@@ -1,0 +1,13 @@
+{
+  "name": "bilibili-cdn-tw",
+  "private": true,
+  "version": "0.0.0",
+  "description": "純函式單元測試（改進工單 E）。userscript 本體不需要 build，這裡只用來跑 vitest。",
+  "type": "commonjs",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.9"
+  }
+}

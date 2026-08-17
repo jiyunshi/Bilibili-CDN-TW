@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili CDN 台灣優化
 // @namespace    BiliCDN_TW
-// @version      1.3.0
+// @version      1.3.1
 // @description  改善台灣網路觀看 Bilibili 影片時的 CDN 連線穩定度，支援自動切換與卡頓監測
 // @author       jiyunshi <chocosensei214@gmail.com>
 // @license      MIT
@@ -53,9 +53,17 @@ var PreferredVideoCodec = 'hevc'
 // false = 放行（頁面其他功能，或其他擴充功能，若也用到 WebRTC 才需要關）
 var BlockWebRTC = true
 
+// EnableWorkerIntercept：是否攔截 new Worker() 並改寫其內部 segment 請求的 CDN host。
+// 改進工單 B 已埋入 BiliCDN.workerStats() 量測這段攔截是否真的有效（Bilibili 播放器
+// 是否真的用 Worker 抓影片分段目前不確定）；觀察數週、確認 mediaSeen 長期為 0 後，
+// 可以把這個值改成 false 停用（不用等緊急發版）——設定面板「攔截修改影片 CDN」
+// checkbox 停用的是「改寫」，這個開關停用的是整段攔截機制本身，範圍更大。
+// 預設 true：維持目前行為不變，真正決定要不要拿掉這 250 行程式碼要等 B 的數據出來。
+var EnableWorkerIntercept = true
+
 // ── 版本號 ────────────────────────────────────────────────────────────
 // 單一事實來源：優先讀 Tampermonkey 注入的 GM_info（跟著 @version 走，改版不用四處手動同步）。
-const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.3.0'
+const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.3.1'
 const parseVer = (v) => String(v || '0').split('.').map(n => parseInt(n, 10) || 0)
 const verGte = (a, b) => {
     const A = parseVer(a), B = parseVer(b)
@@ -1480,13 +1488,13 @@ const sanitizePlayInfoUrls = (root) => {
     return changed
 }
 
-// 改寫 dash/durl item 的 base_url + backup_url
-// 4K/高碼率：白名單 CDN 為主、Akamai 放 backup，避免首段大 fragment 卡在單一 Akamai。
-// 一般碼率：來源含 Akamai 時仍優先 Akamai，純 bilivideo 則換成最佳白名單。
-const transformStreamItem = (item, isDash) => {
-    if (!item) return false
-    isDash = isDash !== false
-
+// 純函式：從 playurl API 回傳的 dash/durl item 找出候選網址（不含任何副作用/模組狀態，
+// 只靠 isAkamaiUrl/isBiliVideoUrl 兩個同樣是純函式的判斷式）。改進工單 E：Bilibili 改版
+// 最容易壞的就是這裡的欄位形狀（base_url/baseUrl、backup_url/backupUrl 是否為陣列、
+// 是否存在），特地切成純函式，改版後能直接用單元測試 3 秒內確認沒把 dash/durl 其中一種
+// 格式弄壞，不用等真的連上 Bilibili 播放才發現。
+const pickStreamUrls = (item, isDash) => {
+    if (!item) return { validUrls: [], akamaiUrl: undefined, biliSrcUrl: undefined, highBitrateItem: false, preferWhitelistPrimary: false }
     const rawUrls = isDash
         ? [item.base_url, item.baseUrl]
             .concat(Array.isArray(item.backup_url) ? item.backup_url : [])
@@ -1500,6 +1508,18 @@ const transformStreamItem = (item, isDash) => {
     const biliSrcUrl = validUrls.find(isBiliVideoUrl)
     const highBitrateItem = isDash && ((item.bandwidth || 0) > 12e6 || (item.height || 0) >= 2160)
     const preferWhitelistPrimary = highBitrateItem && biliSrcUrl
+
+    return { validUrls, akamaiUrl, biliSrcUrl, highBitrateItem, preferWhitelistPrimary }
+}
+
+// 改寫 dash/durl item 的 base_url + backup_url
+// 4K/高碼率：白名單 CDN 為主、Akamai 放 backup，避免首段大 fragment 卡在單一 Akamai。
+// 一般碼率：來源含 Akamai 時仍優先 Akamai，純 bilivideo 則換成最佳白名單。
+const transformStreamItem = (item, isDash) => {
+    if (!item) return false
+    isDash = isDash !== false
+
+    const { validUrls, akamaiUrl, biliSrcUrl, preferWhitelistPrimary } = pickStreamUrls(item, isDash)
 
     validUrls.forEach(u => {
         try {
@@ -2037,6 +2057,81 @@ const interceptNetResponse = (function (theWindow) {
 const biliCdnWorkers = new Set()
 const getWorkerCdnTarget = () => resolvedCdn || getBestCdn() || activeCdnList[0] || PREFERRED_CDN_LIST[0] || ''
 
+// ── Worker 攔截有效性量測（改進工單 B）───────────────────────────────────
+// 這 250 行是全檔最複雜、最脆弱的部分（動態組字串 + importScripts 遠端網址），
+// 且下方 new Worker 攔截處自己都不確定播放器是否真的用 Worker 抓 segment。埋四個分層指標，
+// 用真實數據決定去留：created（攔到幾次 new Worker）→ netCalls（Worker 內
+// 發了幾次網路請求）→ mediaSeen（其中幾次是影片分段）→ rewrites（實際改寫
+// 了幾次）。隱私聲明：所有計數只存在使用者本機（GM_setValue），腳本不會
+// 自動上傳任何資料，回報完全靠使用者手動 BiliCDN.workerStats() 複製貼上。
+const WORKER_STATS_KEY = 'workerStats_v1'
+const WORKER_STATS_SAVE_MS = 5000
+const WORKER_STATS_MAX_SAMPLES = 5
+const workerStats = (() => {
+    try {
+        const raw = JSON.parse(GM_getValue(WORKER_STATS_KEY) || '{}') || {}
+        return {
+            created: +raw.created || 0,
+            netCalls: +raw.netCalls || 0,
+            mediaSeen: +raw.mediaSeen || 0,
+            rewrites: +raw.rewrites || 0,
+            bytes: +raw.bytes || 0,
+            firstAt: +raw.firstAt || 0,
+            lastAt: +raw.lastAt || 0,
+            samples: Array.isArray(raw.samples) ? raw.samples.slice(0, WORKER_STATS_MAX_SAMPLES) : [],
+        }
+    } catch {
+        return { created: 0, netCalls: 0, mediaSeen: 0, rewrites: 0, bytes: 0, firstAt: 0, lastAt: 0, samples: [] }
+    }
+})()
+let workerStatsSaveTimer = null
+const flushWorkerStats = () => {
+    if (workerStatsSaveTimer) { clearTimeout(workerStatsSaveTimer); workerStatsSaveTimer = null }
+    try { GM_setValue(WORKER_STATS_KEY, JSON.stringify(workerStats)) } catch {}
+}
+const scheduleWorkerStatsSave = () => {
+    if (workerStatsSaveTimer) return
+    workerStatsSaveTimer = setTimeout(() => { workerStatsSaveTimer = null; flushWorkerStats() }, WORKER_STATS_SAVE_MS)
+}
+// patch 可含 created/netCalls/mediaSeen/rewrites/bytes（累加）與 sample（worker script 網址樣本）
+const bumpWorkerStats = (patch) => {
+    if (!patch) return
+    const now = Date.now()
+    if (!workerStats.firstAt) workerStats.firstAt = now
+    workerStats.lastAt = now
+    ;['created', 'netCalls', 'mediaSeen', 'rewrites', 'bytes'].forEach(k => {
+        if (patch[k]) workerStats[k] += patch[k]
+    })
+    if (patch.sample && !workerStats.samples.includes(patch.sample)) {
+        workerStats.samples.push(patch.sample)
+        if (workerStats.samples.length > WORKER_STATS_MAX_SAMPLES) workerStats.samples.shift()
+    }
+    scheduleWorkerStatsSave()
+}
+window.addEventListener('pagehide', flushWorkerStats)
+// 判讀規則見改進工單 B：created=0 → 可砍；netCalls=0 → 可砍；mediaSeen=0 → 可砍；
+// mediaSeen>0 → 保留（rewrites=0 時也保留，代表當時剛好不需改寫，不代表沒作用）。
+const summarizeWorkerStats = () => {
+    const days = workerStats.firstAt ? Math.max(1, Math.round((Date.now() - workerStats.firstAt) / 86400000)) : 0
+    let verdict = '尚無資料（先播放影片數分鐘再查）'
+    if (workerStats.firstAt) {
+        if (workerStats.created === 0) verdict = '完全沒攔到 Worker → 可考慮移除'
+        else if (workerStats.netCalls === 0) verdict = '有 Worker 但從未發出網路請求 → 可考慮移除'
+        else if (workerStats.mediaSeen === 0) verdict = '有網路請求但都不是影片分段 → 可考慮移除'
+        else verdict = '有攔到影片分段 → 建議保留'
+    }
+    return {
+        created: workerStats.created,
+        netCalls: workerStats.netCalls,
+        mediaSeen: workerStats.mediaSeen,
+        rewrites: workerStats.rewrites,
+        bytesMB: +((workerStats.bytes || 0) / 1024 / 1024).toFixed(2),
+        observedDays: days,
+        samples: [...workerStats.samples],
+        verdict,
+    }
+}
+
 // worker 強制改寫清單：soft-block / strongly-bad 的 preferred 主機（worker 預設不認這些），
 // 外加賽馬勝者切換時明確指定的舊主機。讓中途切換對 worker segment 流量也生效。
 // 用有時效的 Map 而非永久 Set：一次偶發錯誤不該讓某個 host 整支長片都被流放，
@@ -2088,6 +2183,11 @@ const syncWorkerDisabledState = () => {
 }
 
 const setupClassicWorkerIntercept = () => {
+    // 改進工單 C：安全開關（v1.3.2 半套）。關閉時整段攔截機制不生效，biliCdnWorkers
+    // 維持空 Set——syncWorkerCdnTarget()/syncWorkerDisabledState() 的 forEach 在空 Set
+    // 上單純不做事，不會因為開關關閉而丟例外。程式碼刻意保留不刪，等改進工單 B 的
+    // workerStats() 數據確認這段真的沒用後，才在未來版本整段移除（見 CHANGELOG）。
+    if (!EnableWorkerIntercept) return
     try {
         const OriginalWorker = unsafeWindow.Worker
         if (!OriginalWorker || OriginalWorker.__biliCdnPatched) return
@@ -2126,6 +2226,7 @@ self.addEventListener('message', (event) => {
     }
     if (data && data.__biliCdnBytesPort) {
         BILICDN_BYTES_PORT = data.__biliCdnBytesPort;
+        biliCdnFlushStat();
     }
     if (data && typeof data.__biliCdnDisabled === 'boolean') {
         BILICDN_DISABLED = data.__biliCdnDisabled;
@@ -2140,6 +2241,25 @@ const biliCdnNoteSeg = (url, bytes) => {
             BILICDN_BYTES_PORT.postMessage({ host: h, bytes: +bytes });
         }
     } catch (e) {}
+};
+// 量測（改進工單 B）：netCalls / mediaSeen / rewrites 三個埋點，節流回報給主執行緒
+// 統計。port 到位前的請求不能漏記，先本地累積到 BILICDN_STAT，port 到位（見上方
+// __biliCdnBytesPort 分支）或每 BILICDN_REPORT_MS 才送一次，不逐請求 postMessage。
+let BILICDN_STAT = { netCalls: 0, mediaSeen: 0, rewrites: 0 };
+let BILICDN_STAT_TIMER = null;
+const biliCdnFlushStat = () => {
+    if (!BILICDN_BYTES_PORT) return;
+    if (!BILICDN_STAT.netCalls && !BILICDN_STAT.mediaSeen && !BILICDN_STAT.rewrites) return;
+    try {
+        BILICDN_BYTES_PORT.postMessage({ __stat: BILICDN_STAT });
+        BILICDN_STAT = { netCalls: 0, mediaSeen: 0, rewrites: 0 };
+    } catch (e) {}
+};
+const biliCdnBumpStat = (key) => {
+    BILICDN_STAT[key]++;
+    if (!BILICDN_STAT_TIMER) {
+        BILICDN_STAT_TIMER = setTimeout(() => { BILICDN_STAT_TIMER = null; biliCdnFlushStat(); }, BILICDN_REPORT_MS);
+    }
 };
 const biliCdnIsMedia = (url) => {
     try {
@@ -2158,12 +2278,15 @@ const biliCdnNeedsRedirect = (host) =>
 const biliCdnRewrite = (url) => {
     try {
         if (BILICDN_DISABLED) return url;
+        biliCdnBumpStat('netCalls');
         const abs = biliCdnAbs(url);
         if (!biliCdnIsMedia(abs)) return abs;
+        biliCdnBumpStat('mediaSeen');
         const u = new URL(abs);
         if (!biliCdnNeedsRedirect(u.hostname) || u.hostname === BILICDN_TARGET_HOST) return abs;
         u.hostname = BILICDN_TARGET_HOST;
         u.port = '';
+        biliCdnBumpStat('rewrites');
         return u.toString();
     } catch {
         return url;
@@ -2295,6 +2418,8 @@ import(${JSON.stringify(originalUrl)}).catch((e) => { try { console.error('[Bili
                 mc.port1.onmessage = (e) => {
                     const d = e && e.data
                     if (d && d.bytes && Watchdog && Watchdog.noteExternalBytes) Watchdog.noteExternalBytes(d.host, d.bytes)
+                    if (d && d.bytes) bumpWorkerStats({ bytes: d.bytes })
+                    if (d && d.__stat) bumpWorkerStats(d.__stat)
                 }
                 worker.postMessage({ __biliCdnBytesPort: mc.port2 }, [mc.port2])
             } catch {}
@@ -2326,6 +2451,7 @@ import(${JSON.stringify(originalUrl)}).catch((e) => { try { console.error('[Bili
                     // Worker。開 BiliCDN.verbose(true) 觀察一段時間，若從未看到這行，代表這整段
                     // Worker 攔截對目前播放器版本沒有實際效果，未來可以考慮整塊移除。
                     log('[Worker] patched: ' + originalUrl)
+                    bumpWorkerStats({ created: 1, sample: originalUrl })
                     const source = isModule ? moduleWorkerPatch(originalUrl) : classicWorkerPatch(originalUrl)
                     const blob = new Blob([source], { type: 'application/javascript' })
                     const blobUrl = URL.createObjectURL(blob)
@@ -3304,6 +3430,7 @@ unsafeWindow.BiliCDN = {
         console.log('HTTPDNS:', getHttpDnsStatus())
         console.log('WebRTC 阻擋:', BlockWebRTC)
         console.log('改寫統計:', { ...redirectStats })
+        console.log('Worker 攔截量測:', summarizeWorkerStats())
         console.groupEnd()
         return {
             active:  [...activeCdnList],
@@ -3319,7 +3446,24 @@ unsafeWindow.BiliCDN = {
             discovered: pageDiscoveredCdn,
             httpdns: getHttpDnsStatus(),
             uiInjectStatus,
+            workerStats: summarizeWorkerStats(),
         }
+    },
+    // Worker 攔截有效性量測（改進工單 B）：用真實數據決定 setupClassicWorkerIntercept()
+    // 這 250 行的去留。所有數字只存在本機，回報請直接複製本方法輸出貼給開發者。
+    workerStats() {
+        const s = summarizeWorkerStats()
+        console.group('[BiliCDN] Worker 攔截量測')
+        console.log('created（攔到幾次 new Worker）:', s.created)
+        console.log('netCalls（Worker 內發出幾次網路請求）:', s.netCalls)
+        console.log('mediaSeen（其中幾次是影片分段）:', s.mediaSeen)
+        console.log('rewrites（實際改寫幾次）:', s.rewrites)
+        console.log('累計位元組:', s.bytesMB + ' MB')
+        console.log('已觀察天數:', s.observedDays)
+        console.log('worker script 網址樣本:', s.samples)
+        console.log('判讀:', s.verdict)
+        console.groupEnd()
+        return s
     },
     stats() {
         console.log('[BiliCDN] 改寫統計:', redirectStats,
@@ -3980,14 +4124,9 @@ if (typeof GM_registerMenuCommand === 'function') {
         updateStatusPanel()
         const statusTimer = setInterval(() => {
             if (!document.contains(statusPanel)) {
-                // 面板被拔掉（換片/切全螢幕重繪）：找回設定面板錨點就地重建，
-                // 找不到就先跳過這輪，下一秒再試（不清 timer，不放棄）。
-                const bar = pickMainSettingsAnchor(document.querySelector('.bpx-player-ctrl-setting-others'))
-                if (bar) buildUI(bar)
-                // 不管這次 buildUI 是真的建出新面板、還是因為（多播放器實例等邊界情況）
-                // 判斷面板已存在而 no-op，只要文件裡「現在有」一個活著的狀態面板，這顆
-                // 舊 timer 的任務就完成了才收掉；找不到 bar、或 buildUI 沒能生出面板，
-                // 就讓舊 timer 繼續留著每秒重試——避免自我修復機制因單次 no-op 就永久停擺。
+                // 面板被拔掉（換片/切全螢幕重繪）：找錨點重建的工作交給檔案結尾的
+                // 常駐看門狗 ensureUiPresent 負責，這裡只偵測「新面板已經生出來」
+                // 就收掉自己這顆舊 timer，避免新舊兩套機制同時跑重複建面板。
                 if (document.querySelector('#bilicdn-status-panel')) clearInterval(statusTimer)
                 return
             }
@@ -3999,8 +4138,20 @@ if (typeof GM_registerMenuCommand === 'function') {
         settingsBar.appendChild(statusPanel)
     }
 
+    // 常駐看門狗：waitForElm 只重試 30 秒，若第一次就逾時（網路慢、番劇頁載入久），
+    // buildUI 從未執行過，statusTimer 也就從未誕生，面板會永遠不出現。這顆看門狗
+    // 不受那次逾時影響，持續每 1.5 秒檢查一次；面板存在時直接休眠 no-op，
+    // 面板消失（含「從未建立」與「被拔掉」兩種情況）時才動手找錨點重建。
+    const ensureUiPresent = () => {
+        if (document.querySelector('#bilicdn-status-panel')) return
+        const bar = pickMainSettingsAnchor(document.querySelector('.bpx-player-ctrl-setting-others'))
+        if (bar) buildUI(bar)   // buildUI 開頭已有防重入判斷，找到錨點但面板已存在時會自行 no-op
+    }
+
     waitForElm('.bpx-player-ctrl-setting-others', 30000)
         .then(found => buildUI(pickMainSettingsAnchor(found)))
-        .catch(e => { uiInjectStatus = 'timeout'; err('UI 注入失敗:', e) })
+        .catch(e => { uiInjectStatus = 'timeout'; err('UI 注入逾時，改由看門狗持續重試:', e) })
+
+    setInterval(ensureUiPresent, 1500)
 
 })()

@@ -1,20 +1,10 @@
-<div align="center">
-
 # Bilibili CDN 台灣優化
+
+[![version](https://img.shields.io/badge/version-1.3.3-3f8fa3?style=flat-square)](./CHANGELOG.md) [![license](https://img.shields.io/badge/license-MIT-4f7d4d?style=flat-square)](./LICENSE) ![runtime](https://img.shields.io/badge/runtime-Tampermonkey-a5701f?style=flat-square) ![dependencies](https://img.shields.io/badge/dependencies-zero-4f7d4d?style=flat-square)
 
 **自動繞開卡住的節點，換用連得順的那一個。**
 
-[![version](https://img.shields.io/badge/version-1.3.3-3f8fa3?style=for-the-badge)](./CHANGELOG.md)
-[![license](https://img.shields.io/badge/license-MIT-4f7d4d?style=for-the-badge)](./LICENSE)
-![runtime](https://img.shields.io/badge/runtime-Tampermonkey-a5701f?style=for-the-badge)
-![dependencies](https://img.shields.io/badge/dependencies-zero-4f7d4d?style=for-the-badge)
-
-繁體中文 ・ [English](#english)
-
-</div>
-
-<a name="zh-tw"></a>
-<a name="chinese"></a>
+語言：繁體中文 ｜ [English](#english)
 
 ---
 
@@ -24,32 +14,16 @@ Bilibili 的影片分段（segment）會從多個 CDN 節點下載。這些節�
 
 本腳本在瀏覽器端接手節點選擇：持續量測各節點的實際延遲與下載吞吐量，並在播放過程中依即時表現自動切換。評分演算法經過模擬網格搜尋調校，並非單純的「測速後排序」。
 
-<table>
-<tr><td width="50%" valign="top">
+| 能做到 | 不能做到 |
+| :--- | :--- |
+| 自動避開在台灣不穩定的節點 | 解鎖大會員影片或付費內容 |
+| 播放中下載跟不上時自動換節點 | 繞過地區限制或登入限制 |
+| 針對 4K、時間軸跳轉、背景分頁、多分頁並開分別最佳化 | 提升您實際的網路頻寬 |
+| 學習資料全部存於本機，不需帳號或設定 | — |
 
-### 能做到
-
-- 自動避開在台灣不穩定的節點
-- 播放中下載跟不上時自動換節點
-- 針對 4K／高畫質、時間軸跳轉、背景分頁、多分頁並開分別最佳化
-- 全部設定學習皆存於本機，不需任何帳號或設定
-
-</td><td width="50%" valign="top">
-
-### 不能做到
-
-- 解鎖大會員影片或付費內容
-- 繞過地區限制或登入限制
-- 提升您實際的網路頻寬
-
-</td></tr>
-</table>
-
-> [!NOTE]
-> 若您的頻寬本來就不足以負荷 4K，更換 CDN 無法改善，請先調降畫質。
-
-> [!IMPORTANT]
-> **隱私**：腳本不會將任何資料傳送至第三方伺服器。所有學習到的節點狀態僅保存於 Tampermonkey 的本機儲存空間。
+> **注意**　若您的頻寬本來就不足以負荷 4K，更換 CDN 無法改善，請先調降畫質。
+>
+> **隱私**　腳本不會將任何資料傳送至第三方伺服器。所有學習到的節點狀態僅保存於 Tampermonkey 的本機儲存空間。
 
 ---
 
@@ -61,20 +35,21 @@ Bilibili 的影片分段（segment）會從多個 CDN 節點下載。這些節�
 | **2** | 安裝腳本：以 `bilibili-cdn-tw.user.js` 安裝，或新增空白腳本後將檔案內容完整貼上並儲存。 |
 | **3** | 重新開啟 Bilibili 影片頁：建議先關閉既有分頁再重新開啟。 |
 
-> [!WARNING]
-> **Chrome / Edge 使用者請注意**
->
-> 自 Manifest V3 起，Chrome 需要額外授權才能執行使用者腳本。若播放器設定選單中完全找不到 CDN 狀態區塊，請前往 `chrome://extensions` → Tampermonkey → **詳細資料** → 開啟 **「允許使用者指令碼」**，然後重新整理頁面。
->
-> 這是瀏覽器層級的權限設定，腳本無法自行開啟。
+支援一般影片、番劇、電影、紀錄片、國創、綜藝、課程、賽事等 13 種 `www.bilibili.com` 播放頁。
 
-**支援頁面**：一般影片、番劇、電影、紀錄片、國創、綜藝、課程、賽事等 13 種 `www.bilibili.com` 播放頁。
+### ⚠️ Chrome / Edge 使用者請務必閱讀
+
+自 Manifest V3 起，Chrome 需要額外授權才能執行使用者腳本。**若播放器設定選單中完全找不到 CDN 狀態區塊，多半就是這個原因。**
+
+前往 `chrome://extensions` → Tampermonkey → **詳細資料** → 開啟 **「允許使用者指令碼」**，然後重新整理頁面。
+
+這是瀏覽器層級的權限設定，腳本無法自行開啟。
 
 ---
 
 ## 確認運作狀態
 
-點擊播放器右下角的 ⚙️ 齒輪，設定面板底部會出現 CDN 狀態區塊：
+點擊播放器右下角的齒輪按鈕，設定面板底部會出現 CDN 狀態區塊：
 
 ```text
 ☑ 攔截修改影片CDN
@@ -92,16 +67,11 @@ Bilibili 的影片分段（segment）會從多個 CDN 節點下載。這些節�
 
 ### 播放仍然卡頓
 
-請依序嘗試：
-
-1. 重新整理頁面
-2. 調降一階畫質
-3. 關閉或更換 VPN 節點
-4. 重新啟動瀏覽器
+請依序嘗試：重新整理頁面 → 調降一階畫質 → 關閉或更換 VPN 節點 → 重新啟動瀏覽器。
 
 ### 剛更換網路、VPN 或行動熱點
 
-腳本記憶的節點資料是依前一個網路環境學習而來，換網路後可能不再適用。請按 <kbd>F12</kbd> 開啟主控台並執行：
+腳本記憶的節點資料是依前一個網路環境學習而來，換網路後可能不再適用。請按 `F12` 開啟主控台並執行：
 
 ```js
 BiliCDN.reset()
@@ -120,16 +90,15 @@ location.reload()
 
 ---
 
-<details>
-<summary><b>進階參考：診斷指令、設定選項、支援範圍</b>（一般使用者無須閱讀）</summary>
+## 進階參考
 
-<br>
+一般使用者無須閱讀本節。
 
 ### Tampermonkey 選單指令
 
 多數情況下無須使用主控台。點擊 Tampermonkey 圖示 → 本腳本選單，即可直接操作：
 
-| 指令 | 作用 |
+| 選單項目 | 作用 |
 | :--- | :--- |
 | 🔄 重置所有學習狀態 | 清除全部學習資料並重新整理頁面 |
 | 📊 顯示診斷資訊 | 輸出目前的節點狀態與評分 |
@@ -139,7 +108,7 @@ location.reload()
 
 ### 主控台指令
 
-按 <kbd>F12</kbd> 開啟主控台後可使用下列指令。
+按 `F12` 開啟主控台後可使用下列指令。
 
 **日常診斷**
 
@@ -166,7 +135,7 @@ location.reload()
 | `BiliCDN.probe()` | 重新量測各節點延遲（忽略兩小時快取） |
 | `BiliCDN.bakeoff()` | 手動觸發吞吐量測試（請先播放數秒） |
 | `BiliCDN.setCdn("<host>")` | 固定使用指定節點；`setCdn("null")` 恢復自動 |
-| `BiliCDN.exclude("kw")` / `.include("kw")` | 即時新增／移除排除關鍵字 |
+| `BiliCDN.exclude("kw")` | 即時新增排除關鍵字；`include("kw")` 為移除 |
 | `BiliCDN.verbose(true)` | 開啟詳細記錄 |
 
 ### 設定選項
@@ -184,7 +153,7 @@ var EnableWorkerIntercept = true     // Worker 內 segment 改寫的攔截層開
 
 ### 支援範圍
 
-|  | 支援狀況 |
+| 項目 | 說明 |
 | :--- | :--- |
 | **腳本管理器** | Tampermonkey（建議）；Violentmonkey 多數情況可用 |
 | **不支援** | Greasemonkey 4+、`m.bilibili.com` 行動版網頁、非 Bilibili 網站 |
@@ -193,8 +162,6 @@ var EnableWorkerIntercept = true     // Worker 內 segment 改寫的攔截層開
 ### 隱私說明
 
 腳本不會將任何資料上傳至第三方伺服器。本機儲存的內容僅限於節點健康度統計（例如某節點近期是否不穩定），用途單純是讓下次能更快避開問題節點。
-
-</details>
 
 ---
 
@@ -208,93 +175,92 @@ var EnableWorkerIntercept = true     // Worker 內 segment 改寫的攔截層開
 | **v1.3.1** | 修正設定面板可能永遠不出現的靜默失敗；新增 Worker 攔截有效性量測與一鍵診斷報告。 |
 | **v1.3.0** | CDN 選路核心大修：修正簽名過期時全部節點遭誤判、緩衝量測失準、Akamai 節點緩衝停留 0%、HTTPDNS 判定失準等問題；新增 Tampermonkey 選單指令。 |
 
-> [!NOTE]
-> **關於 v1.3.2**：該版號曾短暫發布後撤回，內容與現行版本完全不同。依本專案版本號規則（版號一經發布即不得指派給不同內容），本次改用 `v1.3.3`。
-
-> [!CAUTION]
-> **請勿繼續使用 v1.2.1。** 該版本經實際發布後證實不穩定，存在 403、CORS 錯誤與 4K 無畫面等問題。
+> **關於 v1.3.2**　該版號曾短暫發布後撤回，內容與現行版本完全不同。依本專案版本號規則（版號一經發布即不得指派給不同內容），本次改用 `v1.3.3`。
+>
+> **請勿繼續使用 v1.2.1**　該版本經實際發布後證實不穩定，存在 403、CORS 錯誤與 4K 無畫面等問題。
 
 ---
 
 ## 授權
 
-MIT License。本軟體依現況提供，不保證能改善所有網路環境。
-
-使用時請自行確認符合所在地法律規範與 Bilibili 服務條款。
-
-<div align="center">
+MIT License。本軟體依現況提供，不保證能改善所有網路環境。使用時請自行確認符合所在地法律規範與 Bilibili 服務條款。
 
 作者 `jiyunshi` ・ <span>chocosensei214</span><span>&#64;</span><span>gmail</span><span>&#46;</span><span>com</span>
 
-</div>
-
 ---
 
-<a name="english"></a>
-<a name="en"></a>
+## English
 
-<div align="center">
-
-# Bilibili CDN Optimiser for Taiwan
+[![version](https://img.shields.io/badge/version-1.3.3-3f8fa3?style=flat-square)](./CHANGELOG.md) [![license](https://img.shields.io/badge/license-MIT-4f7d4d?style=flat-square)](./LICENSE) ![runtime](https://img.shields.io/badge/runtime-Tampermonkey-a5701f?style=flat-square)
 
 **Routes around the stuck node, so playback keeps up.**
 
-[English](#english) ・ [繁體中文](#zh-tw)
+Language: [繁體中文](#bilibili-cdn-台灣優化) ｜ English
 
-</div>
-
-## Overview
+### Overview
 
 Bilibili serves video segments from a range of CDN nodes whose reachability from Taiwan varies enormously — some answer in under 100 ms, some fail DNS resolution entirely, and some resolve but never complete a TCP handshake. The player does not select on behalf of Taiwanese viewers; when it lands on an unreachable node it simply retries, which the viewer experiences as a black screen, endless buffering, or a forced drop in quality.
 
 This userscript takes over node selection in the browser. It continuously measures the real latency and download throughput of each candidate and switches during playback based on observed performance. The scoring algorithm was tuned against simulated playback runs rather than being a plain speed-test sort.
 
-**It does:** avoid nodes that are unstable in Taiwan, switch automatically when playback cannot keep up, and apply dedicated handling for 4K, seeking, background tabs, and multiple concurrent tabs.
+| It does | It does not |
+| :--- | :--- |
+| Avoid nodes that are unstable in Taiwan | Unlock paid or membership-only content |
+| Switch automatically when playback cannot keep up | Bypass region or login restrictions |
+| Handle 4K, seeking, background tabs and multiple tabs | Increase your actual bandwidth |
 
-**It does not:** unlock paid content, bypass region or login restrictions, or increase your actual bandwidth. If your connection cannot sustain 4K, changing CDN will not help — lower the quality instead.
+> **Note**　If your connection cannot sustain 4K, changing CDN will not help — lower the quality instead.
+>
+> **Privacy**　Nothing is transmitted to any third-party server. All learned node data stays in local Tampermonkey storage.
 
-**Privacy:** nothing is transmitted to any third-party server. All learned node data stays in local Tampermonkey storage.
-
-## Installation
+### Installation
 
 1. Install **Tampermonkey** from your browser's extension store.
 2. Install `bilibili-cdn-tw.user.js`, or create a blank script and paste the file's full contents.
 3. Close any existing Bilibili tabs and open a video page afresh.
 
-> [!WARNING]
-> **Chrome / Edge:** since Manifest V3, Chrome requires explicit permission to run userscripts. If the CDN status panel never appears, go to `chrome://extensions` → Tampermonkey → **Details** → enable **"Allow User Scripts"**, then reload the page.
+**Chrome / Edge users:** since Manifest V3, Chrome requires explicit permission to run userscripts. If the CDN status panel never appears, go to `chrome://extensions` → Tampermonkey → **Details** → enable **"Allow User Scripts"**, then reload the page.
 
-## Verifying It Works
+### Verifying It Works
 
-Open the player's ⚙️ settings menu. A CDN status block should appear at the bottom showing the active whitelist order and buffer level. If the block is absent entirely, the permission above is most likely not enabled.
+Open the player's settings gear. A CDN status block should appear at the bottom, showing the active whitelist order and buffer level. If the block is absent entirely, the permission above is most likely not enabled.
 
-## Troubleshooting
+### Troubleshooting
 
 If playback still buffers, in order: reload the page, lower the quality one step, check or change your VPN, restart the browser.
 
-After switching network, VPN, or mobile hotspot, the learned node data no longer reflects your environment. Press <kbd>F12</kbd> and run:
+After switching network, VPN, or mobile hotspot, the learned node data no longer reflects your environment. Press `F12` and run:
 
 ```js
 BiliCDN.reset()
 location.reload()
 ```
 
-**Useful commands:** `BiliCDN.diag()` (full state), `BiliCDN.buf()` (buffer and throughput), `BiliCDN.probe()` (re-measure latency), `BiliCDN.bakeoff()` (throughput test), `BiliCDN.clearDead()` (clear remembered dead nodes), `BiliCDN.report()` (copy a privacy-safe diagnostic report for bug reports).
+**Useful commands**
 
-## Releases
+| Command | Purpose |
+| :--- | :--- |
+| `BiliCDN.diag()` | Full state: candidate order, blacklist, dead nodes, per-node scores |
+| `BiliCDN.buf()` | Buffer level, throughput, switch count, breaker status |
+| `BiliCDN.probe()` | Re-measure node latency |
+| `BiliCDN.bakeoff()` | Run a throughput test |
+| `BiliCDN.clearDead()` | Clear remembered dead nodes |
+| `BiliCDN.report()` | Copy a privacy-safe diagnostic report for bug reports |
+
+### Releases
 
 See [`CHANGELOG.md`](./CHANGELOG.md). **`v1.3.3` is the recommended release.**
 
-- **v1.3.3** — targets the "some videos are simply slow to start" problem. PCDN-only URLs are no longer rewritten into guaranteed failures; stall detection uses the bitrate of the resolution actually playing rather than the highest one offered; throughput is measured over a sliding window so normal gaps between segments are no longer read as stalls; probes no longer compete with the first segments for bandwidth; and a host that fails DNS resolution is no longer mistaken for an unusually low-latency node. Console noise generated by the script itself has been eliminated, and the candidate pool expanded from 3 nodes to 7.
-- **v1.3.1** — fixed a silent failure where the settings panel could permanently fail to appear; added Worker interception metrics and the one-click diagnostic report.
-- **v1.3.0** — CDN routing overhaul: fixed a false positive that blacklisted every node at once when the playurl signature expired, inaccurate buffer and throughput measurement, the buffer panel stalling at 0% on Akamai-routed videos, and HTTPDNS detection scoring.
+| Version | Highlights |
+| :--- | :--- |
+| **v1.3.3** | Targets the "some videos are simply slow to start" problem. PCDN-only URLs are no longer rewritten into guaranteed failures; stall detection uses the bitrate of the resolution actually playing rather than the highest one offered; throughput is measured over a sliding window so normal gaps between segments are not read as stalls; probes no longer compete with the first segments for bandwidth; and a host that fails DNS resolution is no longer mistaken for a low-latency node. Console noise generated by the script itself has been eliminated, and the candidate pool expanded from 3 nodes to 7. |
+| **v1.3.1** | Fixed a silent failure where the settings panel could permanently fail to appear; added Worker interception metrics and the one-click diagnostic report. |
+| **v1.3.0** | CDN routing overhaul: fixed a false positive that blacklisted every node at once when the playurl signature expired, inaccurate buffer and throughput measurement, the buffer panel stalling at 0% on Akamai-routed videos, and HTTPDNS detection scoring. |
 
-> [!NOTE]
-> **On v1.3.2:** that version number was briefly published and then withdrawn, and its contents differ entirely from the current release. Per this project's versioning rule — a version number, once published, is never reassigned to different content — this release uses `v1.3.3`.
+> **On v1.3.2**　That version number was briefly published and then withdrawn, and its contents differ entirely from the current release. Per this project's versioning rule — a version number, once published, is never reassigned to different content — this release uses `v1.3.3`.
+>
+> **Do not use v1.2.1**　It proved unstable in real-world playback (403 errors, CORS failures, and 4K playback showing no picture).
 
-> [!CAUTION]
-> **Do not use v1.2.1.** It proved unstable in real-world playback (403 errors, CORS failures, and 4K playback showing no picture).
-
-## Licence
+### Licence
 
 MIT. Provided as-is, with no guarantee that it improves every network environment. Please ensure your use complies with local law and Bilibili's terms of service.

@@ -3,7 +3,7 @@
 <a name="zh-tw"></a>
 <a name="chinese"></a>
 
-![version](https://img.shields.io/badge/version-1.3.1-3f8fa3?style=flat-square)
+![version](https://img.shields.io/badge/version-1.3.3-3f8fa3?style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT-4f7d4d?style=flat-square)
 ![runtime](https://img.shields.io/badge/runtime-Tampermonkey-a5701f?style=flat-square)
 ![dependencies](https://img.shields.io/badge/dependencies-zero-4f7d4d?style=flat-square)
@@ -12,7 +12,7 @@
 
 給台灣使用者的 Bilibili 影片 CDN 自動切換腳本——自動避開卡頓、黑畫面、連不上的節點，換用比較順的。背後是一套跑過模擬網格搜尋調校的即時評分演算法，不是單純「測速排序」而已。
 
-版本 `1.3.1` ・ 作者 `jiyunshi` ・ <span>chocosensei214</span><span>&#64;</span><span>gmail</span><span>&#46;</span><span>com</span>
+版本 `1.3.3` ・ 作者 `jiyunshi` ・ <span>chocosensei214</span><span>&#64;</span><span>gmail</span><span>&#46;</span><span>com</span>
 
 語言：[繁體中文](#zh-tw) | [English](#english)
 
@@ -124,10 +124,11 @@ var EnableWorkerIntercept = true // Worker 內 segment 改寫的攔截層開關�
 
 ## 📜 更新紀錄
 
-完整版本異動請看 [`CHANGELOG.md`](./CHANGELOG.md)。目前建議使用 **v1.3.1**：
+完整版本異動請看 [`CHANGELOG.md`](./CHANGELOG.md)。目前建議使用 **v1.3.3**：
 
 - **v1.3.0**：CDN 選路核心大修——修正了簽名過期時全部節點一起被誤判成壞掉、緩衝量測不準、Akamai 節點緩衝卡在 0%、HTTPDNS 判斷失準等問題，也新增了 Tampermonkey 選單指令。
 - **v1.3.1**：修掉「設定面板可能永遠不出現」的靜默失敗，新增 Worker 攔截有效性量測與 `BiliCDN.report()` 診斷報告一鍵複製。
+- **v1.3.3**：專治「偶爾有幾部影片點進去特別慢」。PCDN 專用網址不再被改壞、卡頓判定改用實際播放畫質的碼率（不再把 1080p 當 4K 誤判成慢）、下載速度改用滑動視窗（不再把正常的段間空檔當成卡頓）、起播不再跟第一批 segment 搶頻寬，並修掉「解析不出來的節點被誤判成延遲極低的好節點」導致整批 `ERR_NAME_NOT_RESOLVED` 的問題。另外清掉起播關鍵路徑上的浪費：document-start 不再對整份白名單開連線（6 條降到 3 條）、延遲探測讓路給起播、playurl 改寫結果加上記憶化。
 
 **請勿繼續使用 v1.2.1**，對外發布後證實不穩定（403、CORS、4K 無畫面等問題）。
 
@@ -146,7 +147,7 @@ MIT License，依現況提供，不保證能改善所有網路環境。使用時
 
 [繁體中文](#zh-tw)
 
-![version](https://img.shields.io/badge/version-1.3.1-3f8fa3?style=flat-square)
+![version](https://img.shields.io/badge/version-1.3.3-3f8fa3?style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT-4f7d4d?style=flat-square)
 ![runtime](https://img.shields.io/badge/runtime-Tampermonkey-a5701f?style=flat-square)
 ![dependencies](https://img.shields.io/badge/dependencies-zero-4f7d4d?style=flat-square)
@@ -155,7 +156,7 @@ MIT License，依現況提供，不保證能改善所有網路環境。使用時
 
 A userscript that improves Bilibili video playback for Taiwan network conditions — it automatically avoids slow or broken CDN nodes and switches to faster ones based on real download speed, using a scoring algorithm tuned against simulated playback runs, not just a plain speed-test sort.
 
-Version `1.3.1` ・ Author `jiyunshi` ・ <span>chocosensei214</span><span>&#64;</span><span>gmail</span><span>&#46;</span><span>com</span>
+Version `1.3.3` ・ Author `jiyunshi` ・ <span>chocosensei214</span><span>&#64;</span><span>gmail</span><span>&#46;</span><span>com</span>
 
 **What it does:** avoids unstable nodes, switches CDN automatically when playback can't keep up, and adds extra handling for 4K, seeking, background tabs, and multiple open tabs. It does **not** unlock paid videos, bypass region locks, or increase your actual bandwidth. It also doesn't phone home — all learned node data stays in your local browser storage.
 
@@ -172,6 +173,6 @@ location.reload()
 
 Other useful commands: `BiliCDN.diag()`, `BiliCDN.buf()`, `BiliCDN.bakeoff()`, `BiliCDN.clearDead()`, `BiliCDN.report()` (copies a privacy-safe diagnostic report to your clipboard for bug reports).
 
-**Changelog:** see [`CHANGELOG.md`](./CHANGELOG.md). **v1.3.1** is the recommended release. v1.3.0 fixed a false-positive that could blacklist every CDN node at once when the playurl signature expires, inaccurate buffer/throughput measurement, the buffer panel getting stuck at 0% on Akamai-routed videos, and HTTPDNS auto-detection scoring; v1.3.1 fixed a silent failure where the settings panel could permanently fail to appear and added the one-click diagnostic report. **Do not use v1.2.1** — it was unstable in real-world playback.
+**Changelog:** see [`CHANGELOG.md`](./CHANGELOG.md). **v1.3.3** is the recommended release. v1.3.0 fixed a false-positive that could blacklist every CDN node at once when the playurl signature expires, inaccurate buffer/throughput measurement, the buffer panel getting stuck at 0% on Akamai-routed videos, and HTTPDNS auto-detection scoring; v1.3.1 fixed a silent failure where the settings panel could permanently fail to appear and added the one-click diagnostic report; v1.3.3 targets the "some videos are just slow to start" problem — PCDN-only URLs are no longer rewritten into guaranteed failures, stall detection now uses the bitrate of the resolution actually playing instead of the highest one offered, download speed is measured over a sliding window so normal gaps between segments are no longer read as stalls, throughput probes no longer compete with the first segments for bandwidth, and a host that fails DNS resolution is no longer mistaken for an unusually low-latency node. It also trims the work the script itself does on the startup critical path: document-start no longer preconnects the whole whitelist (6 hosts down to 3), the latency probe yields until the startup buffer is established, and the playurl rewrite is memoized instead of re-running on every property read. **Do not use v1.2.1** — it was unstable in real-world playback.
 
 **License:** MIT, provided as-is with no guarantee it improves every network environment.

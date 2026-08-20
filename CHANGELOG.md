@@ -15,11 +15,64 @@
 > **起播搶頻寬**（測速跟第一批 segment 同時搶頻寬）。後續追查 `ERR_NAME_NOT_RESOLVED` 又補上
 > 第五類：**把解析不出來的 host 誤判成延遲極低的好節點**。以下依主題分類。
 
+**本版導覽**
+
+- 一、網址改寫的正確性
+- 二、卡頓判定與量測
+- 三、節點健康度與懲罰機制
+- 四、選路與起播
+- 五、console 錯誤與多分頁
+- 六、診斷、API 與死碼清理
+- 怎麼驗證這一版有沒有用
+- 已知未處理項目
+- 附錄 A：實驗記錄
+- 附錄 B：開發過程中被推翻或排除的判斷
+- 附錄 C：資訊來源與可信度
+
+---
+
+### 一、網址改寫的正確性
+
 **PCDN / 改壞網址**
 
 - 修正：路徑以 `/v1/resource` 開頭的 MCDN / IP:Port 型連結，是 Bilibili 專門發給 PCDN 節點的網址格式，缺少 `trid` 等參數，**換掉 host 之後正規 CDN 一律拒絕**，也無法靠改 host 重組成正常的 upos 網址。舊版直接改，等於保證這次請求失敗，播放器要等這次失敗、再依序試 `backup_url`，起播多等好幾秒。新增 `isPcdnResourceUrl()` 守門。開發過程中的關鍵教訓：第一次只擋在 `rewriteUnstableMediaUrl()` 並**沒有修好**——同一條網址還有兩條路會被改壞（`/v1/resource/xxx.m4s` 以 `.m4s` 結尾，`isBiliFragmentUrl()` 成立後會走進 `normalizeMediaUrl()` 的一般白名單分支；playurl 層的 `transformStreamItem()` 根本不經過 `rewriteUnstableMediaUrl()`）。守門最後放在 `replaceUrlHost()`——**所有改 host 的唯一出入口**，playurl 層與 transport 層一次涵蓋。快篩先用 `indexOf` 再 `new URL()`，因為 `sanitizePlayInfoUrls` 會走訪整包 playurl 回應的幾百個字串欄位。
 - 修正：`pickStreamUrls()` 舊版用 `validUrls.find(isBiliVideoUrl)` 挑來源網址，而 `isBiliVideoUrl` 會匹配 `*.mcdn.bilivideo.cn`——所以 `base_url` 是 PCDN 時，**就算 `backup_url` 裡有現成的 Mirror 型連結可用也不會被選中**，反而拿 PCDN 那條去改 host（必失敗）。改成兩段挑：第一順位是「路徑可改寫、host 也不是 MCDN/BCache」的 Mirror 型，第二順位是至少路徑可改寫的（例如 BCache 型，改 host 有效）；兩者都沒有（整包只剩 `/v1/resource`）就整個不動這個 item，交還播放器照它原本的流程走。備援連結與主流來自同一包 playurl 回應，簽名/deadline 一致，換用不會有額外風險。
 - 修正：`item.backup_url = buildBackupUrls(...)` 直接賦值，當 `buildBackupUrls()` 回空陣列時（沒有可用白名單候選、或來源是不可改寫的 PCDN 網址），**等於把 Bilibili 原本給的備援流全部刪掉**，主流一失敗就無路可退。改成只有 `backups.length` 非零才覆寫。
+
+**綁定節點的串流：`os=<節點>bv` 換 host 必定 403（2026-08-20 實機回報「十分不穩定」）**
+
+> 使用者回報極度不穩定並附上完整 log。關鍵線索藏在 URL 的參數裡：那條 segment 網址帶
+> **`os=cosovbv`**，而賽馬把同一條 URL 換到 `aliov` / `ali` / `cosov` 三台——**三台全部 403**。
+
+- 修正（**本輪最重要**）：Bilibili 有一類 playurl 簽發的網址是**綁定特定節點**的，URL 上帶 `os=<節點>bv`，**換掉 host 之後每一台都回 403**。這造成兩層傷害：
+  1. **賽馬每 90 秒製造 3~4 行紅字**——`probeCdnThroughput` 把 403 吞成 `null`，所以賽馬分不出「這節點慢」和「這條網址誰都不給」，於是逐一把剩下的候選全試一遍，每顆各留一行 403。
+  2. **正常播放也被改壞**——`transformStreamItem` / `normalizeMediaUrl` 照樣改寫，播放器拿到 403 只能一路重試 `backup_url`，表現出來就是「十分不穩定」。
+  
+  **沒有辦法在事前可靠判斷**（實測過 `os` 是別的值時換 host 完全可行，並非全部綁定），所以改成**學習**：任何一次「換 host 之後拿到 403」就把這條串流登記進 `hostLockedStreams`，之後對它完全不改寫、也不賽馬，交還播放器用 B 站原本給的網址跑。學習的觸發點有兩個——賽馬的 403，以及**播放層被我們改寫過的 segment 拿到 403**（只在有改寫時才登記；沒改寫過的 403 是節點自己的問題，不是綁定）。
+  
+  key 優先用 `os` 參數（同一支影片的各種畫質共用同一個 `os`，**一次學習全部畫質適用**），沒有 `os` 才退回 pathname。守門放在 `replaceUrlHost()`——所有改 host 的唯一出入口，跟 PCDN 守門同一處，playurl 層與 transport 層一次涵蓋。SPA 換片（`resetStreamProfile`）與 `BiliCDN.reset()` 都會清空，新影片重新給機會。
+- 修正：`probeCdnThroughput()` 現在把 403 明確回報（`{ forbidden: true }`）而不是吞成 `null`；`doBakeoff` 收到第一個 403 就**登記並立刻中止本輪**，不再逐一試完剩下的候選。`runThroughputBakeoff` 入口也先檢查一次，已知綁定的串流連 Web Locks 都不用搶。
+- 新增：診斷的 `改寫統計` 多一個 `hostLocked` 欄位——數字 > 0 代表你遇過綁定節點的簽名。長期為 0 表示你的環境沒碰到這類串流。
+
+> **這一輪的教訓**：`probeCdnThroughput` 把所有失敗都壓成 `null`，是「**把不同的失敗原因抹平成同一種**」的典型代價。慢、逾時、DNS 失敗、403 需要完全不同的反應（重試 / 降級 / 標死 / **停止對整條串流動手**），而一旦在最底層就丟掉了區別，上層就只能一視同仁地繼續試下去——每試一顆多一行紅字。回報失敗時，**先問「呼叫端會因為知道原因而做出不同決定嗎」**，會的話就不能只回 null。
+
+**其他**
+
+- 修正：`isUnstableCdnHost()` 的 BCache 節點辨識正則 `/^cn-[a-z]{2}-/` 只吃得下兩碼地區代碼，實際看過的寫法包含 `cn-tj-cu-01`（2 碼）、`cn-hbwh-cm-01-11`（4 碼）、`cn-jxnc-cmcc-bcache-06`（4 碼），**四碼的一律漏判**。漏判不會讓它逃過改寫（這些 host 不在白名單，`needsRedirect()` 照樣成立），但會讓 `isMediaSegmentUrl()`、seek 期間的 `mustFix`、以及 Watchdog 挑「元兇」時的排除條件全部對它失效。放寬為 `{2,8}`。
+- 修正：阻擋 HTTPDNS 的 XHR 補送失敗事件。依 XHR 規範，`abort()` 在「已 `open()` 但未 `send()`」的狀態下**不會觸發任何事件**，舊寫法等於讓 Bilibili 的 HTTPDNS 客戶端拿不到任何回呼，只能靠它自己的逾時才會放棄。改成補送一組跟真實網路錯誤一致的事件（`error` → `loadend`）再 `abort()`。這是本版最優先回退的候選項——若觀察到 HTTPDNS 行為異常，先看這裡。
+- 修正：`getVideoKey()` 只看 `location.pathname`，但多 P 影片切換分集**只會改 `?p=`，pathname 一個字都不變**，於是不算換片，新分集整包沿用上一集的碼率、賽馬冷卻與 Watchdog 狀態。長片合集、課程、紀錄片這類多 P 內容最容易中。改成把 `?p=` 併入 key。
+- 修正：SPA 換片時重置碼率狀態（新增 `resetStreamProfile()`，由 `onSpaNavigate()` 呼叫）。從 4K 片切到低碼率片時，`currentStreamBitsPerSec` / `baseBufferTargetBytes` 會殘留舊值，新片沿用舊片的高門檻，重演上面的碼率誤判；反之從低碼率切到 4K 則反應遲鈍。
+
+### 二、卡頓判定與量測
+
+**Watchdog 卡頓判定**
+
+- 修正（本版最重要）：`currentStreamBitsPerSec` 是用 playurl 清單裡**最高畫質**的 bandwidth 設定的（`maxV + maxA`），那不是使用者實際在看的畫質——**只要這支片「有提供」4K，即使實際播 1080p，這個值也會是 4K 的碼率**。連鎖後果全部指向同一個方向：Watchdog 的 `highBitrate` 恆為 `true`，套用 4K 專用嚴格門檻（`minAheadEff` 30 秒、`stallMaxEff` 2）；`minBps` 直接等於 4K 碼率 ÷ 8（約 2.5~4 MB/s），而實際播 1080p 的播放器穩態只會拉約 0.5 MB/s，**永遠低於門檻、`tooSlow` 恆成立**；於是每隔幾秒觸發一次 `switchCdn()`，軟隔離當前節點 10 分鐘、記一次 `failures`、清掉 probe 快取、重建連線，**連續幾輪就能把手上所有好節點依序全部軟隔離掉**，而軟隔離持續 10 分鐘、健康分數的懲罰更久，**災情會延續到之後幾部片**。改用 `<video>.videoHeight` 反查對應 representation 的碼率（新增 `streamProfile` 與 `syncStreamBitrateFromVideo()`，`Watchdog.tick()` 每秒校正一次）——`videoHeight` 是播放器實際解出來的畫面高度，切畫質、ABR 自動降級都會即時反映，比任何清單推測都準。同高度有多個 codec（AVC/HEVC/AV1）時取較大的碼率，寧可略為高估也不要低估到讓 Watchdog 對真正的卡頓變遲鈍；變動小於 5% 不重算，避免 `reached` 狀態每秒抖動。模擬一支提供 2160p/1080p/480p 的影片：實際播 2160p 門檻維持 3.70 MB/s 且仍套用 4K 嚴格模式（不變），實際播 1080p 從 3.70 降到 0.45 MB/s、480p 從 3.70 降到 0.11 MB/s，後兩者都不再誤觸 4K 嚴格模式。
+- 修正（取樣假象）：`bps` 過去是「這一個 tick 的位元組差」，但播放器抓 segment 是**一陣一陣**的——抓完一段就閒置好幾秒，再抓下一段。用單秒差值來看，這些**正常的段間空檔會被算成 bps ≈ 0**，而高碼率下 `stallMaxEff` 只有 2，也就是「連續兩秒沒下載」就換節點。改用最近 `BPS_WINDOW_MS` 的滑動視窗平均；視窗長度**必須大於播放器抓一段的週期**（Bilibili 約 4~6 秒），否則視窗頭尾落在週期的不同相位，量到的還是取樣假象，取 8 秒。原本的 `lastTickBytes` 已無人讀取，一併移除。
+- 修正（本批最重要）：`tooSlow` 只比對 bps 與估算門檻，有一整類**系統性誤判**——播放器在穩態下只會拉「剛好等於碼率」的量（它本來就不該把頻寬吃滿），而門檻是碼率 × 1.05，**只要緩衝低於 `minAheadEff`，bps 就結構性地永遠略低於門檻，判定必然成立**。`stalled` 有完全一樣的缺陷：段間空檔期間 `buffered.end` 本來就不會動，但播放時間持續前進，連續 2~3 個 tick 就達到 `stallMax`。改成加一個「緩衝真的在流失」的條件（`bufferAhead` 低於視窗起點 0.5 秒以上）——緩衝存量的**趨勢**才是「跟不跟得上」的物理事實，沒有流失就不判定，不管估算門檻怎麼說；例外是緩衝已進入危險區（`urgentBuffer`，< 5 秒）時不套用，那時候就算打平也只差一次抖動就斷了。60 秒模擬統計換節點次數：健康情境（分段下載、緩衝穩定 12 秒但低於 16 秒門檻）從 14 次誤判降到 0 次；真的變慢（下載只有需求的 6 成、緩衝持續流失）26 → 25，仍正常偵測；完全斷流 5 → 5，完全不受影響。
+- 修正：`MIN_BPS_FLOOR`（350 KB/s）本來只是為了「碼率未知時不要訂出荒謬的低門檻」，但碼率已知且很低時（480p 只需約 0.10 MB/s），這個下限反而變成一個**跟這支片無關的高門檻**，播放器穩態根本不會拉到那麼快，於是低碼率影片被永久誤判成「太慢」。改成下限不得超過實際需求的 1.2 倍：4K（3.36 MB/s）與 1080p（0.43 MB/s）門檻不變，480p 從 0.34 降到 0.12 MB/s。
+
+### 三、節點健康度與懲罰機制
 
 **DNS 解析失敗（`ERR_NAME_NOT_RESOLVED`）**
 
@@ -53,12 +106,79 @@
 - 修正：剛換完節點沒有給新連線 slow-start 的時間。新連線要重做 TCP+TLS 並經歷慢啟動，這段期間量到的速度天生偏低、`buffered.end` 也還沒開始動——不給寬限就會出現使用者 log 裡那種「賽馬切到 `cos` → 下一個 tick 就懲罰 `cos`」的荒謬序列，新節點根本還沒機會表現。新增 `Watchdog.noteCdnSwitched()`，Watchdog 自己換節點與賽馬中途切換都會呼叫，重置停滯累計與 `buffered` 基準並套用一段寬限。
 - 修正：`doBakeoff` 裡也有一份「用 `getHealthyCdnList()` 的結果整個重寫 `activeCdnList`」的候選池單向棘輪——跟 `reorderCdnsByLatency` 是同一個 bug，但當初只改了後者。這是候選池即使修過還是會變薄的第二個來源。
 
-**Watchdog 卡頓判定**
+**2026-08-19 實機驗證抓到的（本版仍未推版，直接併入 v1.3.3）**
 
-- 修正（本版最重要）：`currentStreamBitsPerSec` 是用 playurl 清單裡**最高畫質**的 bandwidth 設定的（`maxV + maxA`），那不是使用者實際在看的畫質——**只要這支片「有提供」4K，即使實際播 1080p，這個值也會是 4K 的碼率**。連鎖後果全部指向同一個方向：Watchdog 的 `highBitrate` 恆為 `true`，套用 4K 專用嚴格門檻（`minAheadEff` 30 秒、`stallMaxEff` 2）；`minBps` 直接等於 4K 碼率 ÷ 8（約 2.5~4 MB/s），而實際播 1080p 的播放器穩態只會拉約 0.5 MB/s，**永遠低於門檻、`tooSlow` 恆成立**；於是每隔幾秒觸發一次 `switchCdn()`，軟隔離當前節點 10 分鐘、記一次 `failures`、清掉 probe 快取、重建連線，**連續幾輪就能把手上所有好節點依序全部軟隔離掉**，而軟隔離持續 10 分鐘、健康分數的懲罰更久，**災情會延續到之後幾部片**。改用 `<video>.videoHeight` 反查對應 representation 的碼率（新增 `streamProfile` 與 `syncStreamBitrateFromVideo()`，`Watchdog.tick()` 每秒校正一次）——`videoHeight` 是播放器實際解出來的畫面高度，切畫質、ABR 自動降級都會即時反映，比任何清單推測都準。同高度有多個 codec（AVC/HEVC/AV1）時取較大的碼率，寧可略為高估也不要低估到讓 Watchdog 對真正的卡頓變遲鈍；變動小於 5% 不重算，避免 `reached` 狀態每秒抖動。模擬一支提供 2160p/1080p/480p 的影片：實際播 2160p 門檻維持 3.70 MB/s 且仍套用 4K 嚴格模式（不變），實際播 1080p 從 3.70 降到 0.45 MB/s、480p 從 3.70 降到 0.11 MB/s，後兩者都不再誤觸 4K 嚴格模式。
-- 修正（取樣假象）：`bps` 過去是「這一個 tick 的位元組差」，但播放器抓 segment 是**一陣一陣**的——抓完一段就閒置好幾秒，再抓下一段。用單秒差值來看，這些**正常的段間空檔會被算成 bps ≈ 0**，而高碼率下 `stallMaxEff` 只有 2，也就是「連續兩秒沒下載」就換節點。改用最近 `BPS_WINDOW_MS` 的滑動視窗平均；視窗長度**必須大於播放器抓一段的週期**（Bilibili 約 4~6 秒），否則視窗頭尾落在週期的不同相位，量到的還是取樣假象，取 8 秒。原本的 `lastTickBytes` 已無人讀取，一併移除。
-- 修正（本批最重要）：`tooSlow` 只比對 bps 與估算門檻，有一整類**系統性誤判**——播放器在穩態下只會拉「剛好等於碼率」的量（它本來就不該把頻寬吃滿），而門檻是碼率 × 1.05，**只要緩衝低於 `minAheadEff`，bps 就結構性地永遠略低於門檻，判定必然成立**。`stalled` 有完全一樣的缺陷：段間空檔期間 `buffered.end` 本來就不會動，但播放時間持續前進，連續 2~3 個 tick 就達到 `stallMax`。改成加一個「緩衝真的在流失」的條件（`bufferAhead` 低於視窗起點 0.5 秒以上）——緩衝存量的**趨勢**才是「跟不跟得上」的物理事實，沒有流失就不判定，不管估算門檻怎麼說；例外是緩衝已進入危險區（`urgentBuffer`，< 5 秒）時不套用，那時候就算打平也只差一次抖動就斷了。60 秒模擬統計換節點次數：健康情境（分段下載、緩衝穩定 12 秒但低於 16 秒門檻）從 14 次誤判降到 0 次；真的變慢（下載只有需求的 6 成、緩衝持續流失）26 → 25，仍正常偵測；完全斷流 5 → 5，完全不受影響。
-- 修正：`MIN_BPS_FLOOR`（350 KB/s）本來只是為了「碼率未知時不要訂出荒謬的低門檻」，但碼率已知且很低時（480p 只需約 0.10 MB/s），這個下限反而變成一個**跟這支片無關的高門檻**，播放器穩態根本不會拉到那麼快，於是低碼率影片被永久誤判成「太慢」。改成下限不得超過實際需求的 1.2 倍：4K（3.36 MB/s）與 1080p（0.43 MB/s）門檻不變，480p 從 0.34 降到 0.12 MB/s。
+> 這一輪是「腳本已經寫完之後，實際去量它」。分三條路徑：Node vm 沙箱（43 項行為斷言）、
+> 從台灣本機用 `Resolve-DnsName` / `curl` 量所有候選節點、以及在真實 bilibili 頁面上讀
+> `BiliCDN.diag()` / `.buf()` / 面板與 `performance` 時間軸。**通過的部分**：載入無例外、
+> 無未捕捉的 promise rejection、console 全程沒有任何紅字（`ERR_NAME_NOT_RESOLVED` 一行都沒有）、
+> 探測路徑確實是 `/crossdomain.xml`、起播當下探測數為 0（延後機制生效）、
+> preconnect 剛好 3 個 host 且無重複 `<link>`、PCDN 守門與 BCache 4 碼辨識都正確。
+> 以下是**沒通過**的四項。
+
+- 修正（**最嚴重，實機當場重現**）：**判死的時間預算比冷 TLS 握手還短，`upos-sz-mirrorali` 會被系統性誤殺。** 進到使用者瀏覽器時，死節點清單有 4 筆、候選池只剩 **1 個節點**（`cos`），而且最快的 `aliov` 還被關在 24h 黑名單裡。根因量得出來：舊值是 `PROBE_TIMEOUT_MS 2s` + `confirmHostReachable(cdn, 4s)`＝單輪預算 6 秒，`PROBE_TIMEOUT_STRIKES = 2`。但用 curl 從台灣實測，**冷 TLS 握手** `ali` 要 **6.4 秒**、`08c` 7.9 秒、`hw` 8.8 秒（暖機後 `ali` 才降到 0.35~0.56 秒）。也就是說只要探測撞上冷連線，2 秒的探測窗與 4 秒的確認窗會**一起**爆掉，兩輪湊滿 strike 就判死 7 天。v1.3.3 原本的「不再一次定罪」只放寬了次數，**沒有放寬單次的時間預算**，而問題出在後者。改動：新增 `CONFIRM_TIMEOUT_MS = 10000`（大於冷 TLS 實測上界 8.8 秒）並套用到**全部三個** `confirmHostReachable()` 呼叫點——探測逾時那條原本 4 秒、`handleSegmentConnError` 那條只有 2 秒、fetch 被 reject 那條只有 2.5 秒，後兩者都是確認完就直接 `markHostDead()`，同樣會把還在握手的好節點判死；`PROBE_TIMEOUT_STRIKES` 2 → 3。**調參原則寫在常數旁邊：判死的時間預算必須大於冷 TLS 的實測上界，而不是大於暖機 RTT。**
+- 修正：**刑期與證據強度不相稱。**「逾時」是三種死因裡證據最弱的一種——它只代表「在我們給的窗口內沒回應」，而沒回應可能只是冷握手比窗口慢；`DNS`（NXDOMAIN）則是穩定事實。舊版兩者都判 7 天。新增 `DEAD_HOSTS_TIMEOUT_TTL = 1 天`（`deadTtlFor()` 依死因分級：逾時 1d / 一般 7d / DNS 30d）。真的壞掉的節點隔天照樣會再被判一次，成本只是一輪探測；誤殺的好節點則隔天就回得來。
+- 修正：**改了刑期規則，既有紀錄卻永遠用舊規則服完刑。** `markHostDead()` 第一行是 `if (knownDeadHosts.has(host)) return`，而 `probeCdnLatency` 與 `handleSegmentConnError` 開頭也都有 `knownDeadHosts.has(cdn)` 提前 return——所以一個 host 一旦死了，就**不會再有任何程式碼路徑去更新它的刑期**。實機證據：使用者機器上 4 筆死節點全是舊版寫的 7 天，v1.3.3 宣稱的「DNS 類 30 天」對它們從來沒生效過。修法是把校正移到**載入時**（`knownDeadHosts` 的 IIFE）依 `deadTtlFor(e.reason)` 重算，且**只往縮短的方向夾**：規則放寬要能立刻把誤殺的節點放回候選池，規則收緊則不該追溯加重當初依舊規則判下去的刑期。這是 [[cached_state_outlives_fix]] 的同一類問題——只改寫入端不夠，得有一條讓既有狀態自己跟上的路。
+- 修正（文件與實作不一致）：CHANGELOG 把 `Watchdog.stats()` 的對外入口寫成 `BiliCDN.stats()`，但後者是**改寫統計**，兩者是不同的函式；真正的入口是 `BiliCDN.buf()`。而且 `buf()` 算了 `switchCount` / `stallCount` / `breakerSec` 卻**只放進回傳物件、沒有印出來**——被本文件稱為「最直接的判讀依據」的三個數字，使用者在 console 裡其實看不到。兩邊都修：`buf()` 補印一行（斷路器跳脫時直接寫出「換也沒用，瓶頸在頻寬/碼率/跨境線路」），`stats()` 補一行指路。
+
+**第三輪實測：把「暖機值當冷路徑用」的最後兩處清掉（2026-08-19）**
+
+> 使用者重貼後再跑一次 `BiliCDN.probe()`，紅字剩一行、但診斷裡浮出兩件更值得修的事：
+> `軟隔離（session）: ['upos-sz-mirrorali', 'upos-sz-mirrorhw']`（**好節點又被隔離了**），
+> 以及 `cos: {mbps: 201.32, samples: 98}` —— 而 `目前最佳` 正是被這個數字推成 cos 的。
+
+- 修正（**紅字歸零**）：上一輪留下的 `includePresumed` 出口自相矛盾，整個移除。當時的想法是「背景邏輯不打、但使用者手動 `BiliCDN.probe()` 時仍可實測」，可是同一輪也才剛確立「探測是 no-cors、讀不到狀態碼，量到的值不足以讓節點重回候選池」——既然量到也不能用來做任何決定，那一發請求就換不到任何資訊，**只剩下 console 一行紅字**。使用者實測的 `upos-sz-mirrorhw ... 959` 就是它。改成一律不打，`probe()` 改為把這幾台的已知狀態（死因＋剩餘天數／預設清單推定）列出來，並說明唯一有效的翻案方式：`BiliCDN.setCdn("<完整 host>")` 讓它真的去服務 segment，成功後 `successes` 寫入、推定自動失效。**至此腳本在任何情況下都不會主動產生失敗請求。**
+- 修正：**`PROBE_TIMEOUT_MS` 2000 → 8000。** 這是同一個錯誤犯的第三次：1200ms → 2000ms → 8000ms，前兩次都拿**暖機**往返時間去訂一個**永遠發生在冷連線上**的窗口。探測之所以要探測，正是因為那個 host 當下沒有熱連線，所以它遇到的必然是冷路徑。curl 實測冷 TLS：`ali` 6.4 秒、`08c` 7.9 秒、`hw` 8.8 秒（暖機後 `ali` 才 0.35~0.56 秒）。2000ms 對 `ali` 是**必定逾時**，於是每輪探測都把一台好節點丟進 5 分鐘軟隔離。8000ms 涵蓋真實候選的冷握手，又低於 `CONFIRM_TIMEOUT_MS`（10 秒）保留確認空間；探測不在起播關鍵路徑上且各候選並行，多等這幾秒沒有代價。
+- 修正：逾時但確認可達時，舊版 `recordCdnLatency(cdn, PROBE_TIMEOUT_MS)` 記的是一個**捏造的平坦常數**，讓所有逾時節點看起來一樣慢，也把假數字摻進 EWMA——使用者看到的 `ali: latency 1701` 不對應任何一次真實量測。改記真實耗時。同時新增 `PROBE_SLOW_STRIKES = 2`：「連得到、只是比窗口慢」要**連續兩輪**才軟隔離。一次慢有太多無辜原因（冷握手、頁面自己在搶連線配額），而軟隔離 5 分鐘等於這段時間完全不考慮這個節點。任何一次窗內回應都會把計數歸零。
+- 修正（**選路被假數據主導**）：`recordCdnThroughput()` 把**每一筆**傳輸都餵進 `ewmaMbps`，包含 init segment（~1KB）、小段 Range 請求，以及**從 HTTP 快取回來的回應**（`durationMs` 被 `Math.max(1, …)` 夾成 1ms）。這些算出來的不是頻寬，是除以趨近零的分母：64KB / 2ms = 262 Mbps。使用者實測的 `cos: {mbps: 201.32, samples: 98}` 就是這樣堆出來的——而 `ewmaMbps` 是選路計分的主要項，於是 `目前最佳` 被推成 cos，儘管**同一份診斷裡** cos 的 latency 是 516ms、`aliov` 只有 142ms（curl 實測 TTFB 亦然：cos ~1000ms、aliov ~70ms）。實質效果是「**誰剛好命中快取，誰就被判定為最快的節點**」。新增最小樣本門檻 `MIN_THROUGHPUT_SAMPLE_BYTES = 128KB` 與 `MIN_THROUGHPUT_SAMPLE_MS = 5`：不夠大／太短的傳輸仍計入 `h.bytes`（面板累計下載量要準），但**不進 `ewmaMbps`、不算一個 sample**——`samples` 的語意就是「有幾次有效的吞吐量量測」，計分與抖動估計都靠它加權。順帶：128KB 這個門檻本來就存在，舊版只拿它判 `slowSamples`，現在提升為兩者共用。
+- 新增：吞吐量資料的一次性重置（`throughputSchema` = 2）。修了規則不代表被規則汙染的資料會自己乾淨——使用者機器上那 98 個假樣本會繼續影響選路直到 TTL 過期。載入時若 schema 版本落後就清掉 `ewmaMbps` / `varMbps` / `samples` / `slowSamples`，**保留 `successes` / `failures` / `latencyMs`**（那幾項不受這條規則影響，清掉等於白白丟資料）。同 [[cached_state_outlives_fix]] 的處理原則。
+
+> **這三輪回頭看，同一個根因反覆換皮出現了三次**：把「暖機情境量到的數字」當成
+> 「冷路徑會遇到的數字」（PROBE_TIMEOUT_MS 三次調參）、把「有回應」當成「可以用」
+> （no-cors 讀不到 959）、把「傳完了」當成「量到頻寬了」（1KB / 快取命中也算一個樣本）。
+> 共通點是**量測的前提條件沒有跟著判斷一起被檢查**。下次新增任何「用輕量觀測代替真實
+> 情境」的機制時，先寫下這三個問題：我量的是不是我要判斷的那件事？這個值在最壞情況下
+> 是多少？拿它做決定的門檻有沒有涵蓋那個最壞情況？
+
+**軟隔離其實不是暫時的：一個 2~10 分鐘的處分把節點鎖到兩小時後（2026-08-19，本輪的結構性修正）**
+
+> 使用者問「這是不是最優解，不然一直改不是辦法」。答案是：前面每一項修的都是真 bug，
+> 但它們有一個共同的上游沒被處理。`BiliCDN.diag()` 的完整狀態暴露了它——
+> `black: [ali]`、`soft: {cos, aliov}`：**三個候選節點同時處於處分中**，
+> 選路已經完全靠 fallback 在跑。
+
+- 修正（**結構性**）：`softBlockCdn()` 除了設到期時間，還做了 `activeCdnList.splice(idx, 1)`，把節點**從候選池母體移除**。但到期時只有 `isCdnSoftBlocked()` 變回 `false`，**沒有任何路徑把它放回池子**——只有 `403-single` 與斷路器 retraction 兩個窄分支會還原，而一般的 `probe-slow` / `probe-timeout` / `net-fail` / `fragment-error-*` / Watchdog 的 `CDN_SOFT_BLOCK_MS` 都不會。於是一個號稱「2~10 分鐘」的暫時處分，實際效果是**移出候選池直到兩小時後的下一輪探測重建**。而且會自我強化：被移出池子就選不到，選不到就不會成功，不成功就更不會有人把它放回來。
+  這正是這份腳本反覆出現的同一個錯誤：**用「此時此刻的狀態」去編輯「整個 session 的候選池母體」**。`reorderCdnsByLatency` 與 `doBakeoff` 的單向棘輪已經各修過一次，註解就寫在那裡（「只重新排序，**不縮減集合**」），但沒有人回頭檢查 `softBlockCdn` 犯的是同一個錯。
+  修法是直接移除那行 splice。被隔離的節點已經被**三層獨立地**擋住：(1) `isCdnStronglyBad()` 內含 `isCdnSoftBlocked()`，`getHealthyCdnList()` 的 `usable` 會濾掉它；(2) `getCdnHealthScore()` 的 `softPenalty = 1.5`（大於 1，必定排到最後）；(3) `getBestCdn` / `preconnectCdn` / 賽馬候選等處各自都有檢查。差別只在於：到期之後它會**自己回到可選狀態**。另外，全部節點都被隔離時 `usable` 為空會退回 `pool`（照分數排序），比候選池被掏空健康得多。
+
+**懲罰力道要跟候選池大小成比例（2026-08-19，發布版的正確一般解）**
+
+> 使用者指出上一節的結論不能用：「僅針對我目前這台電腦的狀況而已，我這是要面向其他使用者」。
+> 完全正確。把 `aliov` 寫死等於把一台機器的實測結果強加給所有人——別人的電信商、路由、
+> 是否掛 VPN 都不同，而這份腳本的整個價值就在於**它會自己學出每個人網路上最快的節點**。
+> 真正該修的不是「選哪個節點」，而是「懲罰機制假設了一個不存在的大池子」。
+
+- 修正：`addToBlacklist()` 加上與候選池大小連動的煞車。黑名單是 **24 小時**的重罰，這個設計預設池子夠大、關掉一個的代價很小；但升級門檻只是 `cdnFailCount >= 2`，而台灣環境的實際可用候選常常只有 3 個。也就是說**一次 Wi-Fi 斷線或 VPN 重連，就能讓每個正在使用的節點各記 2 次失敗，把整個池子一次關光**，接下來 24 小時無節點可用。新增 `MIN_USABLE_POOL = 2` 與 `countUsableCandidates()`：若關掉這個之後可用節點會少於門檻，就**不關**，降級成一次軟隔離（現在的軟隔離是真的會到期的，見上一節）。「這個節點目前表現不好」仍然被表達出來——選路會排開它——但不會演變成「整天都沒有節點可用」。
+  這條規則**與使用者的網路環境無關**：不管誰的機器上哪一台最快，池子見底時的正確反應都是「降級處分」而不是「繼續關人」。實測驗證：連續對三個節點各觸發一次黑名單，舊版會全關 24 小時，新版最多關到剩 2 個可用。
+
+**關於 `upos-sz-mirroraliov` 是不是「一個節點」**：不是，它 CNAME 到 `queniuaa.com`、8 個 A 記錄、TTL 3 秒——`setCdn()` 固定它不等於綁死單一台機器。詳見下面的〈實驗記錄〉實驗 3。
+
+**探測讀不到狀態碼：`BiliCDN.probe()` 會把區域拒絕的節點放回候選池（2026-08-19 使用者實測回報）**
+
+> 使用者按建議跑了一次 `BiliCDN.probe()`，結果 console 出現
+> `upos-sz-mirrorhw.bilivideo.com/crossdomain.xml?_c=... 959`，而診斷顯示
+> `白名單順序` 從 3 個變成 4 個、多出來的正是 `upos-sz-mirrorhw`，只被軟隔離 5 分鐘。
+
+- 修正：**探測「量到了」不等於「可以用」。** `probeCdnLatency()` 與 `confirmHostReachable()` 都是 `mode: 'no-cors'` 的 fetch，拿到的是 **opaque response ——讀不到狀態碼**。這在設計上是刻意的（見前面「重構：延遲探測併成單一 no-cors fetch」：resolve = 有回應 = 可達），但它有個沒被想到的後果：**959 這種「伺服器明確拒絕你」的回應，在探測層看起來跟 200 完全一樣**。959 是 Bilibili 對台灣 IP 的區域拒絕自訂碼，它本來就列在 `HARD_FAIL_STATUSES`（403/451/959）裡、在 segment 層一次就會被判死——但探測層永遠看不到它。於是 `upos-sz-mirrorhw` 被判成「可達、只是慢」，拿到一個有限的延遲值，重新進入 `activeCdnList`。
+  修法不是去猜狀態碼（opaque 就是讀不到），而是修正**資格認定**：候選池重建時一併濾掉 presumed 節點。一次 `/crossdomain.xml` 的 opaque 回應根本回答不了「這台能不能服務影片」，沒有資格解除「已知在台灣不可用」的推定；真正有資格解除它的是**實際服務過 segment**——那會寫進 `successes` / `samples`，`isPresumedDnsFailHost()` 隨即自動轉為 `false`。這條路本來就存在，只是先前沒有把「探測成功」與「服務成功」區分開。
+- 修正（可用性）：`BiliCDN.probe()` 現在會把 presumed 節點的實測結果**單獨列出來**（標明「僅供參考，不會放回候選池」），並說明真正要解除推定的作法（`BiliCDN.setCdn("<完整 host>")` 固定使用它，成功服務過就自動解除；`BiliCDN.setCdn("null")` 改回自動）。不加這段的話，使用者會看到「我手動測了、它有回應、但清單裡還是沒有它」而無從理解——這正是實測當下的困惑點。
+
+> **這一題的通則**：把「可達性」和「可用性」當成同一件事，是這份腳本反覆踩到的坑。
+> `no-cors` 換來的是「不會被 CORS 擋、不會噴 CORS 錯誤」，代價是**放棄所有回應內容**，
+> 包括你最需要的狀態碼。用它做的判斷，結論只能停在「有東西回應了」，
+> 不能延伸成「這台可以拿來播影片」。
+
+### 四、選路與起播
 
 **選路與起播**
 
@@ -81,41 +201,20 @@
 
 以上五項用 Node `vm` 載入腳本 + DOM/GM 樁做行為測試，並把改動還原成舊實作當對照組跑同一套測試，實測差異：讀 3 次 `responseText` 從轉換 3 次降到 1 次；起播當下發出的延遲探測從 6 個降到 0 個；載入當下的 preconnect 從 6 個 host 降到 3 個。
 
-**其他**
+**節點順序不穩：單輪冷連線就能把最快的節點排到最後（2026-08-19 使用者回報「不太穩定」）**
 
-- 修正：`isUnstableCdnHost()` 的 BCache 節點辨識正則 `/^cn-[a-z]{2}-/` 只吃得下兩碼地區代碼，實際看過的寫法包含 `cn-tj-cu-01`（2 碼）、`cn-hbwh-cm-01-11`（4 碼）、`cn-jxnc-cmcc-bcache-06`（4 碼），**四碼的一律漏判**。漏判不會讓它逃過改寫（這些 host 不在白名單，`needsRedirect()` 照樣成立），但會讓 `isMediaSegmentUrl()`、seek 期間的 `mustFix`、以及 Watchdog 挑「元兇」時的排除條件全部對它失效。放寬為 `{2,8}`。
-- 修正：阻擋 HTTPDNS 的 XHR 補送失敗事件。依 XHR 規範，`abort()` 在「已 `open()` 但未 `send()`」的狀態下**不會觸發任何事件**，舊寫法等於讓 Bilibili 的 HTTPDNS 客戶端拿不到任何回呼，只能靠它自己的逾時才會放棄。改成補送一組跟真實網路錯誤一致的事件（`error` → `loadend`）再 `abort()`。這是本版最優先回退的候選項——若觀察到 HTTPDNS 行為異常，先看這裡。
-- 修正：`getVideoKey()` 只看 `location.pathname`，但多 P 影片切換分集**只會改 `?p=`，pathname 一個字都不變**，於是不算換片，新分集整包沿用上一集的碼率、賽馬冷卻與 Watchdog 狀態。長片合集、課程、紀錄片這類多 P 內容最容易中。改成把 `?p=` 併入 key。
-- 修正：SPA 換片時重置碼率狀態（新增 `resetStreamProfile()`，由 `onSpaNavigate()` 呼叫）。從 4K 片切到低碼率片時，`currentStreamBitsPerSec` / `baseBufferTargetBytes` 會殘留舊值，新片沿用舊片的高門檻，重演上面的碼率誤判；反之從低碼率切到 4K 則反應遲鈍。
+> 使用者回報紅字已經消失，但「順暢度沒上來、偶爾拉進度條跳轉會加載蠻慢」。
+> 診斷裡有一個直接的矛盾：`目前最佳: upos-sz-mirrorali`，但 `頁面發現 CDN: upos-sz-mirroraliov`，
+> 而白名單順序是 `[ali, cos, aliov]` —— **最快的節點被排到最後**。
 
-**診斷面板新增欄位**
+- 修正：`reorderCdnsByLatency()` 用**這一輪的原始值** `r.ms` 排序。但單輪的 `r.ms` 幾乎完全由「這條連線當下是冷是熱」決定（實測冷熱差距：`ali` 冷 6.4 秒 vs 暖 0.4 秒，超過十倍），拿它當唯一依據等於讓節點順序隨機跳動——而 `activeCdnList` 的順序在「所有節點都還沒有吞吐量樣本」時，正是 `getHealthyCdnList()` 的排序依據。於是這個雜訊會一路傳到選路：使用者那一輪排出 `[ali, cos, aliov]`，但同一份診斷裡 `aliov` 的 `latencyMs` 是 142ms、`cos` 是 516ms，curl 實測 TTFB 更是 `aliov` ~70ms / `ali` ~560ms / `cos` ~1000ms。改成用 `cdnHealth[].latencyMs`（`recordCdnLatency()` 維護的 EWMA，本輪的值已併入）排序——這個欄位本來就是為了吸收抖動而存在的，先前卻沒有被排序用到。
+- 修正：`getHealthyCdnList()` 在「雙方都沒有吞吐量樣本」時直接退回 `a.index - b.index`，隱含假設「`activeCdnList` 的順序就是延遲順序」。那只在剛跑完探測時成立——黑名單還原、死節點救回等路徑是照 `PREFERRED_CDN_LIST.indexOf` 重排的，那是一份**寫死的靜態順序**，跟這台機器的實測快慢無關。於是在「還沒有吞吐量樣本」這段期間（正是剛裝好、或吞吐量資料剛被重置、而且起播最需要選對節點的時候），選路可能完全忽略我們明明已經量到的延遲差距。補上：先比實測延遲，有量測資料的優先於完全沒量過的，都沒有才退回 index。有吞吐量樣本時維持原本由 `getCdnHealthScore()` 決定，不受影響。
 
-- `改寫統計` → `pcdnSkipped`：命中 `/v1/resource` 而**刻意不改寫**的次數。持續增加＝你的網路環境常被分配到 PCDN，代表 PCDN 那組修正對你有實質效果；長期為 0＝你沒被分到 PCDN，慢片原因在別處。`BiliCDN.reset()` 已同步重置。
-- `CDN 吞吐評分` → `scoreStartup`：起播模式（無探索加成）的分數。與 `score` 差距大＝該節點目前主要靠「還沒被測過」在拿分。
-
-**死碼清理**
-
-- 用 acorn 做 AST 分析（先前用正則的版本有 bug：`'https://'` 裡的 `//` 會被誤判成註解，把整行後半吃掉，導致漏報）。刪除：`isHttpDnsAutoAllowing`（宣告後全檔零引用）、`HttpDnsAutoPilot.reloadProfile`（定義後從未被呼叫）、`transformList` 的計數與回傳值（三個呼叫端都不接 `{ total, akamai }`，等於每次都白算一輪）、`probeCdnLatency` 的 `skipped: true`（沒有任何地方讀）、`probeCdnThroughput` 的 `mbps` / `bytes`（數值早在前一行的 `recordCdnThroughput` 就已入帳）。
-- 修復（比刪除更好的處理）：**`logRedirect()` 從來沒有真的輸出過任何東西**——它維護了節流狀態（`_redirectLogTs` / `_redirectLogTotal`）、累計了 `redirectStats.quietRedirects`、接收了 `reason` 參數，然後什麼都沒印，整套機制（含 3 個常數、2 個 Map、3 個呼叫點，約 25 行）全部空轉。選擇補回那一行 `log()` 而不是刪掉整套：輸出本來就受 `Config.verbose` 控制、預設靜音，只有使用者主動 `BiliCDN.verbose(true)` 排查時才會出現，刪掉等於永久失去一個本來已經寫好的排查工具；`reason` 參數同時恢復作用。
-- 追加清理：換節點觸發條件改用危險線之後，`needMoreBuffer`、`minAheadEff`、`MIN_BUFFER_AHEAD` 三者連鎖失去讀者，一併刪除。這是死碼掃描在推版前抓到的——當時註解還寫著「`needMoreBuffer` 保留給要不要繼續積極監看用」，但那件事其實是由 `monitorAfterReached` 在管，註解是錯的。**不留下「看起來還有作用其實沒有」的變數。**
-- 保留（工具誤判，刻意不動）：`pickStreamUrls` 的 `highBitrateItem`（回傳物件裡沒人接，但該函式的註解明說是「特地切成純函式，改版後能直接用單元測試確認」，這是測試介面不是死碼）、`probeCodecCapability` 的 `supported` / `smooth`（只有 `powerEfficient` 會被讀，但保持與 Media Capabilities API 回傳形狀一致有其價值）。另有一批被工具標記、經人工確認是誤判的：公開 API 方法（`BiliCDN.probe` 等，使用者在 console 直接呼叫）、診斷輸出欄位（`jitter`、`scoreStartup` 等，是印給使用者看的）、Worker 訊息協定（`__biliCdn*`，在樣板字串裡以字串形式存取）、動態存取（`CODEC_PROBE_STRING[kind]`）、瀏覽器 API 設定鍵（`childList`、`subtree`）。
-
-**怎麼驗證這一版有沒有用**
-
-- PCDN 那組：`BiliCDN.diag()` → `改寫統計` → 看 `pcdnSkipped` 是否在增加。
-- 速度判斷那組：播放時 `BiliCDN.diag()` 的 `軟隔離（session）` 應該長時間維持空白；舊版在緩衝略低於門檻時會反覆把節點丟進去。
-- 碼率誤判：找一支**有 4K 選項但只看 1080p** 的長片播 10 分鐘，之後看 `軟隔離（session）` 清單。舊版通常會累積好幾個節點，新版應該是空的。
-- DNS 那組：**健康節點的探測不該再產生任何 console 紅字**——舊版每輪對每個節點打 `favicon.ico` 必定 403/405，現在打 `crossdomain.xml` 回 200。Network 面板篩 `crossdomain` 可以看到探測請求本身（每個節點每輪 1 個，不是 2 個）。真的連不到的節點仍會紅一次，出現當下 `BiliCDN.diag()` 的死節點清單應該立刻多出那個 host（reason `DNS` 或 `DNS-segment`），之後 30 天內不再出現；若同一個 host 每隔幾天就再紅一次，代表標死沒有被持久化，那是 bug。
-- 起播路徑的浪費：F12 → Network → 開影片頁 → 看載入最前面那段有沒有一堆對不同 `upos-*.bilivideo.com` 的 `favicon.ico` 請求。新版對「已經用過一陣子」的使用者應該一個都沒有（延後到緩衝建立之後才跑）；preconnect 的 host 數量應該是 3 個而不是 6 個。
-- 遇到慢片時的通用排查：F12 → Network → 篩 `m4s` → 看第一個請求。403/404 後面跟著同路徑不同 host 的重試＝改寫改壞了（本版應已修掉）；200 但 Waiting/TTFB > 1 秒＝節點沒快取正在回源（見下面 `og` 議題）；200、TTFB 短但下載慢＝單純頻寬/節點壅塞，屬正常，腳本會自己切。
-
-**已知未處理項目**（需實測才能決定）
-
-- **依 `og` 參數選對應 mirror**：`og` 對應的通常是中國境內 mirror（ali/cos/hw），命中快取機率高，但從台灣連過去的線路品質不一定比海外 `ov` 節點好。是「有貨但線路遠」對上「線路好但可能沒貨」，沒實測數據不能賭。影響：熱門片幾乎無差；冷門/舊片首段可能仍多等 0.5~3 秒。
-- ~~**放寬候選池**~~ → **已完成（2026-08-20 定案）**。`alib` / `ali02` / `bos` / `tf-all-tx` 經實驗 4 驗證並經實機確認零錯誤，已加入清單，**候選池 3 → 7**。`cosov` 一度解除排除但被實機推翻（實驗 5），維持排除。`INITIAL_DEAD_HOSTS_TW`（hwov / hw / hz-aliov）維持不變，那三個是 NXDOMAIN 或 TCP 握不完，且仍保留「本機成功過一次就自動解除推定」的路徑。
-- **4K 強制不用 Akamai**：`preferWhitelistPrimary`（bandwidth > 12M 或 height ≥ 2160）會把 Akamai 從 primary 拉下來。Akamai 在台灣有時解析到美國 IP、有時很快，純調參。影響：部分 4K 片起播可能變慢。
-- **保留原始 URL 當保命 backup**：原本要做，實作到一半判定**幫助有限**——播放器只在「硬失敗」時才跳 backup，對「連得上但很慢」完全沒用，而主要症狀正是慢。加了只是徒增複雜度（還要在 `sanitizePlayInfoUrls` 與 `normalizeMediaUrl` 兩處各加白名單保護）。
-- **`reorderCdnsByLatency` 的前段排序看似被覆蓋**：檢查後確認**不能刪**——它決定 `activeCdnList` 的 index 順序，而 `getHealthyCdnList()` 在「所有節點都沒有樣本」時正是用 index 排序。（誤判，已排除）
+> 補充說明「seek 偶爾很慢」的其餘部分：節點順序修正之後仍可能發生，因為主要成因是
+> **CDN 對那個位元組範圍沒有快取、要回源**——那屬於下面「已知未處理項目」的 `og` 議題，
+> 腳本層面沒有安全的解法（`og` 對應的境內 mirror 命中快取機率高，但從台灣連過去的線路
+> 品質不一定更好，沒有實測數據不能賭）。想要最穩定的體驗，可以直接固定最快的節點：
+> `BiliCDN.setCdn("upos-sz-mirroraliov.bilivideo.com")`，恢復自動用 `BiliCDN.setCdn("null")`。
 
 **推版前 Node vm 實測抓到的**
 
@@ -126,21 +225,7 @@
 - 修正：`startCdnProbe()` 的起播預熱**少熱一個 host**，而且少的正好是最需要它的那一個。本版把預熱對象改成「playurl 這次真的會寫進去的那 3 個」，寫法是 `[getCurrentCdn(STARTUP_PICK), ...getHealthyCdnList(STARTUP_PICK).slice(0, 2)]`——但 primary 幾乎總是排名第一，所以先 `slice(0, 2)` 再交給 `preconnectBatch` 的 `Set` 去重時，backup 的第一顆會跟 primary 重複被吃掉，實際只熱身到 **2 個**。而 `buildBackupUrls()` 是先 `filter(cdn !== primaryHost)` **才** `slice(0, 2)`，拿到的是不重複的兩顆——於是第二顆 backup 永遠是冷的，它偏偏就是「primary 失敗後播放器第二個會試」的節點，要救場時卻得從零做 DNS + TCP + TLS。修法是讓兩邊的順序一致（先剔除 primary 再 slice）。實測對照：修正前預熱 `cos, ali`／實際寫入 `cos, ali, aliov`（`aliov` 冷連線）；修正後兩者完全重合。
 - 修正（**與上一版那條「過濾順序寫反了」是同一個 bug 的上游**）：`getHealthyCdnList()` 的可達性優先只補在**排序層**，但候選池會從**成員層**被掏空。`cdnFailCount` 累積到 `CDN_FAIL_THRESHOLD`（**2 次**）就會 `addToBlacklist()`，而黑名單是直接把節點從 `activeCdnList` **移除**的。也就是說一次網路斷線（Wi-Fi 掉線、VPN 重連、切換行動網路）就能讓每個正在用的節點各記 2 次失敗、一次全部清出候選池——池子裡只剩那幾個「從沒被用過、所以也從沒失敗過」的已知不解析節點，`reachable` 篩完是空的，`base` 退回 `all`，於是**每一顆 segment 都被改寫到 NXDOMAIN**。而黑名單一綁就是 **24 小時**：使用者看到的是整天完全播不出來加上滿螢幕 `ERR_NAME_NOT_RESOLVED`，比原本那個網路問題嚴重得多。修法是在「候選池裡連一個可達節點都不剩」時，從 `PREFERRED_CDN_LIST` 撈回可達的節點當退路——**寧可用一個被黑名單過、但至少解得到 IP 的節點，也不要用一個必定失敗的**。正常情況（只要還有任何一個可達節點在池內）完全不受影響。實測對照：修正前 `getBestCdn()` 回傳 `upos-sz-mirrorhwov`、segment 實際被改寫過去；修正後回到 `upos-sz-mirroraliov`。
 
-
-**2026-08-19 實機驗證抓到的（本版仍未推版，直接併入 v1.3.3）**
-
-> 這一輪是「腳本已經寫完之後，實際去量它」。分三條路徑：Node vm 沙箱（43 項行為斷言）、
-> 從台灣本機用 `Resolve-DnsName` / `curl` 量所有候選節點、以及在真實 bilibili 頁面上讀
-> `BiliCDN.diag()` / `.buf()` / 面板與 `performance` 時間軸。**通過的部分**：載入無例外、
-> 無未捕捉的 promise rejection、console 全程沒有任何紅字（`ERR_NAME_NOT_RESOLVED` 一行都沒有）、
-> 探測路徑確實是 `/crossdomain.xml`、起播當下探測數為 0（延後機制生效）、
-> preconnect 剛好 3 個 host 且無重複 `<link>`、PCDN 守門與 BCache 4 碼辨識都正確。
-> 以下是**沒通過**的四項。
-
-- 修正（**最嚴重，實機當場重現**）：**判死的時間預算比冷 TLS 握手還短，`upos-sz-mirrorali` 會被系統性誤殺。** 進到使用者瀏覽器時，死節點清單有 4 筆、候選池只剩 **1 個節點**（`cos`），而且最快的 `aliov` 還被關在 24h 黑名單裡。根因量得出來：舊值是 `PROBE_TIMEOUT_MS 2s` + `confirmHostReachable(cdn, 4s)`＝單輪預算 6 秒，`PROBE_TIMEOUT_STRIKES = 2`。但用 curl 從台灣實測，**冷 TLS 握手** `ali` 要 **6.4 秒**、`08c` 7.9 秒、`hw` 8.8 秒（暖機後 `ali` 才降到 0.35~0.56 秒）。也就是說只要探測撞上冷連線，2 秒的探測窗與 4 秒的確認窗會**一起**爆掉，兩輪湊滿 strike 就判死 7 天。v1.3.3 原本的「不再一次定罪」只放寬了次數，**沒有放寬單次的時間預算**，而問題出在後者。改動：新增 `CONFIRM_TIMEOUT_MS = 10000`（大於冷 TLS 實測上界 8.8 秒）並套用到**全部三個** `confirmHostReachable()` 呼叫點——探測逾時那條原本 4 秒、`handleSegmentConnError` 那條只有 2 秒、fetch 被 reject 那條只有 2.5 秒，後兩者都是確認完就直接 `markHostDead()`，同樣會把還在握手的好節點判死；`PROBE_TIMEOUT_STRIKES` 2 → 3。**調參原則寫在常數旁邊：判死的時間預算必須大於冷 TLS 的實測上界，而不是大於暖機 RTT。**
-- 修正：**刑期與證據強度不相稱。**「逾時」是三種死因裡證據最弱的一種——它只代表「在我們給的窗口內沒回應」，而沒回應可能只是冷握手比窗口慢；`DNS`（NXDOMAIN）則是穩定事實。舊版兩者都判 7 天。新增 `DEAD_HOSTS_TIMEOUT_TTL = 1 天`（`deadTtlFor()` 依死因分級：逾時 1d / 一般 7d / DNS 30d）。真的壞掉的節點隔天照樣會再被判一次，成本只是一輪探測；誤殺的好節點則隔天就回得來。
-- 修正：**改了刑期規則，既有紀錄卻永遠用舊規則服完刑。** `markHostDead()` 第一行是 `if (knownDeadHosts.has(host)) return`，而 `probeCdnLatency` 與 `handleSegmentConnError` 開頭也都有 `knownDeadHosts.has(cdn)` 提前 return——所以一個 host 一旦死了，就**不會再有任何程式碼路徑去更新它的刑期**。實機證據：使用者機器上 4 筆死節點全是舊版寫的 7 天，v1.3.3 宣稱的「DNS 類 30 天」對它們從來沒生效過。修法是把校正移到**載入時**（`knownDeadHosts` 的 IIFE）依 `deadTtlFor(e.reason)` 重算，且**只往縮短的方向夾**：規則放寬要能立刻把誤殺的節點放回候選池，規則收緊則不該追溯加重當初依舊規則判下去的刑期。這是 [[cached_state_outlives_fix]] 的同一類問題——只改寫入端不夠，得有一條讓既有狀態自己跟上的路。
-- 修正（文件與實作不一致）：CHANGELOG 把 `Watchdog.stats()` 的對外入口寫成 `BiliCDN.stats()`，但後者是**改寫統計**，兩者是不同的函式；真正的入口是 `BiliCDN.buf()`。而且 `buf()` 算了 `switchCount` / `stallCount` / `breakerSec` 卻**只放進回傳物件、沒有印出來**——被本文件稱為「最直接的判讀依據」的三個數字，使用者在 console 裡其實看不到。兩邊都修：`buf()` 補印一行（斷路器跳脫時直接寫出「換也沒用，瓶頸在頻寬/碼率/跨境線路」），`stats()` 補一行指路。
+### 五、console 錯誤與多分頁
 
 **紅字回歸：`force` 是個過寬的旗標（2026-08-19 使用者實測回報）**
 
@@ -159,109 +244,88 @@
 > 這次是 `force`：驗證時測的是「起播不打紅字」（`isStartupRun` 那條），
 > 而漏掉的是「卡頓後重排也不該打紅字」（`force` 那條）。
 
-**探測讀不到狀態碼：`BiliCDN.probe()` 會把區域拒絕的節點放回候選池（2026-08-19 使用者實測回報）**
+**全面稽核：把「腳本自己會製造的 console 錯誤」逐類清掉（2026-08-20）**
 
-> 使用者按建議跑了一次 `BiliCDN.probe()`，結果 console 出現
-> `upos-sz-mirrorhw.bilivideo.com/crossdomain.xml?_c=... 959`，而診斷顯示
-> `白名單順序` 從 3 個變成 4 個、多出來的正是 `upos-sz-mirrorhw`，只被軟隔離 5 分鐘。
+> 目標訂得很明確：**主控台不該出現任何本腳本造成的錯誤**。做法是把「腳本會發出的請求」
+> 與「腳本會產生的例外／拒絕」兩類來源逐一列舉、逐一驗證，而不是等使用者回報再追。
 
-- 修正：**探測「量到了」不等於「可以用」。** `probeCdnLatency()` 與 `confirmHostReachable()` 都是 `mode: 'no-cors'` 的 fetch，拿到的是 **opaque response ——讀不到狀態碼**。這在設計上是刻意的（見前面「重構：延遲探測併成單一 no-cors fetch」：resolve = 有回應 = 可達），但它有個沒被想到的後果：**959 這種「伺服器明確拒絕你」的回應，在探測層看起來跟 200 完全一樣**。959 是 Bilibili 對台灣 IP 的區域拒絕自訂碼，它本來就列在 `HARD_FAIL_STATUSES`（403/451/959）裡、在 segment 層一次就會被判死——但探測層永遠看不到它。於是 `upos-sz-mirrorhw` 被判成「可達、只是慢」，拿到一個有限的延遲值，重新進入 `activeCdnList`。
-  修法不是去猜狀態碼（opaque 就是讀不到），而是修正**資格認定**：候選池重建時一併濾掉 presumed 節點。一次 `/crossdomain.xml` 的 opaque 回應根本回答不了「這台能不能服務影片」，沒有資格解除「已知在台灣不可用」的推定；真正有資格解除它的是**實際服務過 segment**——那會寫進 `successes` / `samples`，`isPresumedDnsFailHost()` 隨即自動轉為 `false`。這條路本來就存在，只是先前沒有把「探測成功」與「服務成功」區分開。
-- 修正（可用性）：`BiliCDN.probe()` 現在會把 presumed 節點的實測結果**單獨列出來**（標明「僅供參考，不會放回候選池」），並說明真正要解除推定的作法（`BiliCDN.setCdn("<完整 host>")` 固定使用它，成功服務過就自動解除；`BiliCDN.setCdn("null")` 改回自動）。不加這段的話，使用者會看到「我手動測了、它有回應、但清單裡還是沒有它」而無從理解——這正是實測當下的困惑點。
+- 修正：**HTTPDNS 阻擋會製造 `Uncaught (in promise)`**。`fetch` 那條路是 `Promise.reject(new DOMException(...))`，但我們**不控制呼叫端**——B 站的 HTTPDNS 客戶端若沒有 `.catch()`，被拒絕的 promise 就會在 console 留下一行紅字。阻擋機制本身不該是噪音來源（跟探測路徑改用 `/crossdomain.xml` 同一個原則）。fetch 沒有「不 reject 的網路錯誤」可用，所以改成**合成一個失敗回應**：503 + 合法 JSON body，同時滿足「檢查 `res.ok`」與「直接 `res.json()`」兩種客戶端寫法，且不會二次拋錯。合成的 Response 沒有經過網路層，瀏覽器不會有任何 network entry 或 console 輸出。對照組：XHR 那條路本來就是補送 `error` + `loadend` 事件（XHR 的 error 事件不印紅字），這次是讓 fetch 對齊它的行為。
+- 修正（**狀態持久化不完整**，兩個欄位）：`probeSlows`（2026-08-19 新增）在 `ensureCdnHealth` 預設值、存檔 payload、載入器**三處都沒有接上**；`probeTimeouts`（既有）則是**有寫入存檔卻從未被讀回**，是個只寫不讀的欄位。後果一樣：兩個「連續 N 輪才定罪」的 strike 計數**只在單一頁面 session 內成立**，重整一次就歸零——而探測最快兩小時才跑一輪，等於門檻永遠達不到，機制形同虛設。三處一起補齊，載入時用小上限夾住避免殘留異常值一載入就定罪（上限寫字面量而非引用 `PROBE_*_STRIKES`，那兩個常數定義在檔案更後面，載入期引用會踩 TDZ）。
+- 查證後確認**沒有問題**：`cdnHealth` 的跨分頁合併**早就實作了**（`scheduleCdnHealthSave()` 存檔前先讀回 GM 最新內容，逐 CDN 以 `lastSeen` 較新者為準）。前一節把它列為「待處理」是誤判——從「共用儲存 + 整包寫入」這個模式直接推論，而沒有先讀那段程式碼。
+- 稽核結果（無需修改）：全檔無死碼（本批新增的 15 個符號全部有被引用）；沒有漏接 `.catch` 的自有 promise 鏈；`err()` 預設被 `Config.verbose`（false）擋住；只有 3 處未經 verbose 把關的 `console.error/warn`，分別只在「CustomCDN 填了非法網域」「Worker module import 失敗」「`revive()` 傳入不存在的 host」時觸發，正常使用不會出現。
 
-> **這一題的通則**：把「可達性」和「可用性」當成同一件事，是這份腳本反覆踩到的坑。
-> `no-cors` 換來的是「不會被 CORS 擋、不會噴 CORS 錯誤」，代價是**放棄所有回應內容**，
-> 包括你最需要的狀態碼。用它做的判斷，結論只能停在「有東西回應了」，
-> 不能延伸成「這台可以拿來播影片」。
+**驗證方式**
 
-**第三輪實測：把「暖機值當冷路徑用」的最後兩處清掉（2026-08-19）**
+- 新增 `tests11.js`：把**每一個對外 API** 與媒體 URL 的攔截路徑都跑一遍，並在 **`ok` / `fail` / `403` 三種網路模式**下各跑一次（沙箱的 fetch/XHR 樁可切換成全部拒絕或全部 403），斷言**零未捕捉的 rejection、零例外**。含「全部節點都死」的極端狀態。
+- 新增 `tests12.js`：驗證狀態持久化的三處一致性，含「存檔後再讀回不遺失」與「較新的另一分頁資料不被覆寫」。
+- 12 套測試共 **212 項，連跑 3 輪全部 0 失敗**；`tests11` 另外在 3 種網路模式下各 38 項全過。
+- 用 curl 重新確認 7 個候選節點的探測路徑**全部回 200**（cosov 對照組確認仍是 403，證明排除正確）。過程中量到 `upos-sz-mirrorali` 是**間歇性黑洞**（4 輪裡 1 輪 TCP 完全連不上、15 秒無回應，其餘 3 輪 0.56~0.77s 正常），且它的 IP 段一天內從 `221.178.37.x` 換成 `116.77.74.x`——這正是 8 秒探測窗 + 10 秒確認 + 連續 3 次才判死的設計要吸收的情況，且我們的 abort 一定早於 Chrome 自己的 TCP timeout，不會留下紅字。
 
-> 使用者重貼後再跑一次 `BiliCDN.probe()`，紅字剩一行、但診斷裡浮出兩件更值得修的事：
-> `軟隔離（session）: ['upos-sz-mirrorali', 'upos-sz-mirrorhw']`（**好節點又被隔離了**），
-> 以及 `cos: {mbps: 201.32, samples: 98}` —— 而 `目前最佳` 正是被這個數字推成 cos 的。
+> **能保證與不能保證**：腳本**自己發出的請求**現在全部指向已實測回 200/206 的端點，
+> 且不會產生未捕捉的 rejection——這部分可以保證。但**不能保證 console 永遠乾淨**：
+> 被改寫後的 segment 請求若打到當下正好故障的節點（如上述 ali 的間歇性黑洞），
+> 瀏覽器仍會記錄該次失敗，那是任何 CDN 都可能發生的事，只能靠健康評分把它排開。
 
-- 修正（**紅字歸零**）：上一輪留下的 `includePresumed` 出口自相矛盾，整個移除。當時的想法是「背景邏輯不打、但使用者手動 `BiliCDN.probe()` 時仍可實測」，可是同一輪也才剛確立「探測是 no-cors、讀不到狀態碼，量到的值不足以讓節點重回候選池」——既然量到也不能用來做任何決定，那一發請求就換不到任何資訊，**只剩下 console 一行紅字**。使用者實測的 `upos-sz-mirrorhw ... 959` 就是它。改成一律不打，`probe()` 改為把這幾台的已知狀態（死因＋剩餘天數／預設清單推定）列出來，並說明唯一有效的翻案方式：`BiliCDN.setCdn("<完整 host>")` 讓它真的去服務 segment，成功後 `successes` 寫入、推定自動失效。**至此腳本在任何情況下都不會主動產生失敗請求。**
-- 修正：**`PROBE_TIMEOUT_MS` 2000 → 8000。** 這是同一個錯誤犯的第三次：1200ms → 2000ms → 8000ms，前兩次都拿**暖機**往返時間去訂一個**永遠發生在冷連線上**的窗口。探測之所以要探測，正是因為那個 host 當下沒有熱連線，所以它遇到的必然是冷路徑。curl 實測冷 TLS：`ali` 6.4 秒、`08c` 7.9 秒、`hw` 8.8 秒（暖機後 `ali` 才 0.35~0.56 秒）。2000ms 對 `ali` 是**必定逾時**，於是每輪探測都把一台好節點丟進 5 分鐘軟隔離。8000ms 涵蓋真實候選的冷握手，又低於 `CONFIRM_TIMEOUT_MS`（10 秒）保留確認空間；探測不在起播關鍵路徑上且各候選並行，多等這幾秒沒有代價。
-- 修正：逾時但確認可達時，舊版 `recordCdnLatency(cdn, PROBE_TIMEOUT_MS)` 記的是一個**捏造的平坦常數**，讓所有逾時節點看起來一樣慢，也把假數字摻進 EWMA——使用者看到的 `ali: latency 1701` 不對應任何一次真實量測。改記真實耗時。同時新增 `PROBE_SLOW_STRIKES = 2`：「連得到、只是比窗口慢」要**連續兩輪**才軟隔離。一次慢有太多無辜原因（冷握手、頁面自己在搶連線配額），而軟隔離 5 分鐘等於這段時間完全不考慮這個節點。任何一次窗內回應都會把計數歸零。
-- 修正（**選路被假數據主導**）：`recordCdnThroughput()` 把**每一筆**傳輸都餵進 `ewmaMbps`，包含 init segment（~1KB）、小段 Range 請求，以及**從 HTTP 快取回來的回應**（`durationMs` 被 `Math.max(1, …)` 夾成 1ms）。這些算出來的不是頻寬，是除以趨近零的分母：64KB / 2ms = 262 Mbps。使用者實測的 `cos: {mbps: 201.32, samples: 98}` 就是這樣堆出來的——而 `ewmaMbps` 是選路計分的主要項，於是 `目前最佳` 被推成 cos，儘管**同一份診斷裡** cos 的 latency 是 516ms、`aliov` 只有 142ms（curl 實測 TTFB 亦然：cos ~1000ms、aliov ~70ms）。實質效果是「**誰剛好命中快取，誰就被判定為最快的節點**」。新增最小樣本門檻 `MIN_THROUGHPUT_SAMPLE_BYTES = 128KB` 與 `MIN_THROUGHPUT_SAMPLE_MS = 5`：不夠大／太短的傳輸仍計入 `h.bytes`（面板累計下載量要準），但**不進 `ewmaMbps`、不算一個 sample**——`samples` 的語意就是「有幾次有效的吞吐量量測」，計分與抖動估計都靠它加權。順帶：128KB 這個門檻本來就存在，舊版只拿它判 `slowSamples`，現在提升為兩者共用。
-- 新增：吞吐量資料的一次性重置（`throughputSchema` = 2）。修了規則不代表被規則汙染的資料會自己乾淨——使用者機器上那 98 個假樣本會繼續影響選路直到 TTL 過期。載入時若 schema 版本落後就清掉 `ewmaMbps` / `varMbps` / `samples` / `slowSamples`，**保留 `successes` / `failures` / `latencyMs`**（那幾項不受這條規則影響，清掉等於白白丟資料）。同 [[cached_state_outlives_fix]] 的處理原則。
+**實驗 5：cosov 回退，與「多開分頁不穩定」（2026-08-20 實機回報）**
 
-> **這三輪回頭看，同一個根因反覆換皮出現了三次**：把「暖機情境量到的數字」當成
-> 「冷路徑會遇到的數字」（PROBE_TIMEOUT_MS 三次調參）、把「有回應」當成「可以用」
-> （no-cors 讀不到 959）、把「傳完了」當成「量到頻寬了」（1KB / 快取命中也算一個樣本）。
-> 共通點是**量測的前提條件沒有跟著判斷一起被檢查**。下次新增任何「用輕量觀測代替真實
-> 情境」的機制時，先寫下這三個問題：我量的是不是我要判斷的那件事？這個值在最壞情況下
-> 是多少？拿它做決定的門檻有沒有涵蓋那個最壞情況？
+> 使用者重貼後回報：console 又有紅字，而且**多開 bilibili 分頁會造成不穩定**。
+> 兩份 log 逐行清點的結果：**所有錯誤都來自 cosov**，上一輪新增的其他四個鏡像
+> （`alib` / `ali02` / `bos` / `tf-all-tx`）**零錯誤**。
 
-**節點順序不穩：單輪冷連線就能把最快的節點排到最後（2026-08-19 使用者回報「不太穩定」）**
+- 回退：`ExcludeHostKeywords` 預設改回 `['cosov']`。**實驗 4 的結論範圍下錯了。**那個實驗證明的是「cosov 能服務一次 16KB 的 range 請求」，我卻拿它推論成「cosov 可以當候選節點」。實機打臉的兩種方式：
+  1. **探測必定 403**：`PROBE_PATH` 是 `/crossdomain.xml`，而實驗 2 早就量到 cosov 對這個路徑回 403。把它放進候選池，等於保證每一輪探測都固定產生一行紅字——這是我在實驗 2 的表格裡寫下、卻在做決策時沒有回頭看的資料。
+  2. **真實播放會失敗**：`ERR_FAILED 514`，且回應**不帶 `Access-Control-Allow-Origin`**，瀏覽器直接報 CORS 錯誤（實測 URL 是 `os=cosovbv`、`bw=22M` 的 4K/HDR 串流）。一次 16KB 的小範圍請求量不到這個。
+  `cosov` 仍保留在 `PREFERRED_CDN_LIST_RAW` 裡，想自己實驗的人 `BiliCDN.include("cosov")` 就能放行，不必改原始碼。
+- 修正（**多開分頁不穩定的主因**）：`lastBakeoffAt` 是**純記憶體變數**，於是每個分頁各跑一場獨立的吞吐量賽馬——每場最多 4 顆候選 × 最多 768KB、每 90 秒一輪。開 5 個分頁就是 5 倍的背景流量在跟正在播的影片搶頻寬。
+  值得注意的是**既有的跨分頁機制擋不住這個**：`runThroughputBakeoff` 已經有 Web Locks（`ifAvailable`）與 BroadcastChannel 心跳，但那兩者擋的是「**同時**」，不是「**頻率**」——A 分頁測完釋放鎖，B 分頁的 90 秒冷卻是它自己記憶體裡的 `0`，於是立刻接著測，C 分頁再接著測。N 個分頁只是把 N 場賽馬**排隊跑完**，總流量一點都沒省。
+  修法：冷卻時間戳改存 GM storage（`lastBakeoffAt_v1`），所有分頁共用，真正收斂成「每 90 秒全域一場」。賽馬結果本來就寫進共用的 `cdnHealth`，所以同一個時間窗內只需要一個分頁去測。時間戳在 `doBakeoff()` 開頭就先寫入（不是跑完才寫），避免兩個分頁同時通過檢查的競爭窗口。
 
-> 使用者回報紅字已經消失，但「順暢度沒上來、偶爾拉進度條跳轉會加載蠻慢」。
-> 診斷裡有一個直接的矛盾：`目前最佳: upos-sz-mirrorali`，但 `頁面發現 CDN: upos-sz-mirroraliov`，
-> 而白名單順序是 `[ali, cos, aliov]` —— **最快的節點被排到最後**。
+> **這一輪的教訓**：實驗結論的**適用範圍**要跟實驗設計一樣嚴格地寫下來。
+> 「一次 16KB range 請求回 206」和「這個節點可以拿來播影片」之間差了：持續傳輸、
+> 大位元組數、高碼率/HDR 串流、以及探測路徑本身的行為。我在同一份文件的實驗 2
+> 就記下了「cosov 對 /crossdomain.xml 回 403」，做決策時卻沒有回頭交叉比對——
+> **有記錄不等於有用到記錄。**
 
-- 修正：`reorderCdnsByLatency()` 用**這一輪的原始值** `r.ms` 排序。但單輪的 `r.ms` 幾乎完全由「這條連線當下是冷是熱」決定（實測冷熱差距：`ali` 冷 6.4 秒 vs 暖 0.4 秒，超過十倍），拿它當唯一依據等於讓節點順序隨機跳動——而 `activeCdnList` 的順序在「所有節點都還沒有吞吐量樣本」時，正是 `getHealthyCdnList()` 的排序依據。於是這個雜訊會一路傳到選路：使用者那一輪排出 `[ali, cos, aliov]`，但同一份診斷裡 `aliov` 的 `latencyMs` 是 142ms、`cos` 是 516ms，curl 實測 TTFB 更是 `aliov` ~70ms / `ali` ~560ms / `cos` ~1000ms。改成用 `cdnHealth[].latencyMs`（`recordCdnLatency()` 維護的 EWMA，本輪的值已併入）排序——這個欄位本來就是為了吸收抖動而存在的，先前卻沒有被排序用到。
-- 修正：`getHealthyCdnList()` 在「雙方都沒有吞吐量樣本」時直接退回 `a.index - b.index`，隱含假設「`activeCdnList` 的順序就是延遲順序」。那只在剛跑完探測時成立——黑名單還原、死節點救回等路徑是照 `PREFERRED_CDN_LIST.indexOf` 重排的，那是一份**寫死的靜態順序**，跟這台機器的實測快慢無關。於是在「還沒有吞吐量樣本」這段期間（正是剛裝好、或吞吐量資料剛被重置、而且起播最需要選對節點的時候），選路可能完全忽略我們明明已經量到的延遲差距。補上：先比實測延遲，有量測資料的優先於完全沒量過的，都沒有才退回 index。有吞吐量樣本時維持原本由 `getCdnHealthScore()` 決定，不受影響。
+### 六、診斷、API 與死碼清理
 
-> 補充說明「seek 偶爾很慢」的其餘部分：節點順序修正之後仍可能發生，因為主要成因是
-> **CDN 對那個位元組範圍沒有快取、要回源**——那屬於下面「已知未處理項目」的 `og` 議題，
-> 腳本層面沒有安全的解法（`og` 對應的境內 mirror 命中快取機率高，但從台灣連過去的線路
-> 品質不一定更好，沒有實測數據不能賭）。想要最穩定的體驗，可以直接固定最快的節點：
-> `BiliCDN.setCdn("upos-sz-mirroraliov.bilivideo.com")`，恢復自動用 `BiliCDN.setCdn("null")`。
+**診斷面板新增欄位**
 
-**軟隔離其實不是暫時的：一個 2~10 分鐘的處分把節點鎖到兩小時後（2026-08-19，本輪的結構性修正）**
+- `改寫統計` → `pcdnSkipped`：命中 `/v1/resource` 而**刻意不改寫**的次數。持續增加＝你的網路環境常被分配到 PCDN，代表 PCDN 那組修正對你有實質效果；長期為 0＝你沒被分到 PCDN，慢片原因在別處。`BiliCDN.reset()` 已同步重置。
+- `CDN 吞吐評分` → `scoreStartup`：起播模式（無探索加成）的分數。與 `score` 差距大＝該節點目前主要靠「還沒被測過」在拿分。
 
-> 使用者問「這是不是最優解，不然一直改不是辦法」。答案是：前面每一項修的都是真 bug，
-> 但它們有一個共同的上游沒被處理。`BiliCDN.diag()` 的完整狀態暴露了它——
-> `black: [ali]`、`soft: {cos, aliov}`：**三個候選節點同時處於處分中**，
-> 選路已經完全靠 fallback 在跑。
+**死碼清理**
 
-- 修正（**結構性**）：`softBlockCdn()` 除了設到期時間，還做了 `activeCdnList.splice(idx, 1)`，把節點**從候選池母體移除**。但到期時只有 `isCdnSoftBlocked()` 變回 `false`，**沒有任何路徑把它放回池子**——只有 `403-single` 與斷路器 retraction 兩個窄分支會還原，而一般的 `probe-slow` / `probe-timeout` / `net-fail` / `fragment-error-*` / Watchdog 的 `CDN_SOFT_BLOCK_MS` 都不會。於是一個號稱「2~10 分鐘」的暫時處分，實際效果是**移出候選池直到兩小時後的下一輪探測重建**。而且會自我強化：被移出池子就選不到，選不到就不會成功，不成功就更不會有人把它放回來。
-  這正是這份腳本反覆出現的同一個錯誤：**用「此時此刻的狀態」去編輯「整個 session 的候選池母體」**。`reorderCdnsByLatency` 與 `doBakeoff` 的單向棘輪已經各修過一次，註解就寫在那裡（「只重新排序，**不縮減集合**」），但沒有人回頭檢查 `softBlockCdn` 犯的是同一個錯。
-  修法是直接移除那行 splice。被隔離的節點已經被**三層獨立地**擋住：(1) `isCdnStronglyBad()` 內含 `isCdnSoftBlocked()`，`getHealthyCdnList()` 的 `usable` 會濾掉它；(2) `getCdnHealthScore()` 的 `softPenalty = 1.5`（大於 1，必定排到最後）；(3) `getBestCdn` / `preconnectCdn` / 賽馬候選等處各自都有檢查。差別只在於：到期之後它會**自己回到可選狀態**。另外，全部節點都被隔離時 `usable` 為空會退回 `pool`（照分數排序），比候選池被掏空健康得多。
+- 用 acorn 做 AST 分析（先前用正則的版本有 bug：`'https://'` 裡的 `//` 會被誤判成註解，把整行後半吃掉，導致漏報）。刪除：`isHttpDnsAutoAllowing`（宣告後全檔零引用）、`HttpDnsAutoPilot.reloadProfile`（定義後從未被呼叫）、`transformList` 的計數與回傳值（三個呼叫端都不接 `{ total, akamai }`，等於每次都白算一輪）、`probeCdnLatency` 的 `skipped: true`（沒有任何地方讀）、`probeCdnThroughput` 的 `mbps` / `bytes`（數值早在前一行的 `recordCdnThroughput` 就已入帳）。
+- 修復（比刪除更好的處理）：**`logRedirect()` 從來沒有真的輸出過任何東西**——它維護了節流狀態（`_redirectLogTs` / `_redirectLogTotal`）、累計了 `redirectStats.quietRedirects`、接收了 `reason` 參數，然後什麼都沒印，整套機制（含 3 個常數、2 個 Map、3 個呼叫點，約 25 行）全部空轉。選擇補回那一行 `log()` 而不是刪掉整套：輸出本來就受 `Config.verbose` 控制、預設靜音，只有使用者主動 `BiliCDN.verbose(true)` 排查時才會出現，刪掉等於永久失去一個本來已經寫好的排查工具；`reason` 參數同時恢復作用。
+- 追加清理：換節點觸發條件改用危險線之後，`needMoreBuffer`、`minAheadEff`、`MIN_BUFFER_AHEAD` 三者連鎖失去讀者，一併刪除。這是死碼掃描在推版前抓到的——當時註解還寫著「`needMoreBuffer` 保留給要不要繼續積極監看用」，但那件事其實是由 `monitorAfterReached` 在管，註解是錯的。**不留下「看起來還有作用其實沒有」的變數。**
+- 保留（工具誤判，刻意不動）：`pickStreamUrls` 的 `highBitrateItem`（回傳物件裡沒人接，但該函式的註解明說是「特地切成純函式，改版後能直接用單元測試確認」，這是測試介面不是死碼）、`probeCodecCapability` 的 `supported` / `smooth`（只有 `powerEfficient` 會被讀，但保持與 Media Capabilities API 回傳形狀一致有其價值）。另有一批被工具標記、經人工確認是誤判的：公開 API 方法（`BiliCDN.probe` 等，使用者在 console 直接呼叫）、診斷輸出欄位（`jitter`、`scoreStartup` 等，是印給使用者看的）、Worker 訊息協定（`__biliCdn*`，在樣板字串裡以字串形式存取）、動態存取（`CODEC_PROBE_STRING[kind]`）、瀏覽器 API 設定鍵（`childList`、`subtree`）。
 
-**設計層面的結論（回答「這是不是最優解」）**
+---
 
-> 程式碼層面：目前每一個已知缺陷都已修正，125 項行為斷言全通過，console 零紅字。
-> 但要誠實指出一個**設計與實際選擇空間不匹配**的問題，它不是 bug，改不改是取捨：
+### 怎麼驗證這一版有沒有用
 
-本腳本有 **7 套彼此重疊的懲罰機制**——持久死節點（1/7/30 天）、黑名單（24 小時）、
-軟隔離（2~10 分鐘）、`cdnFailCount`（2 次即升級黑名單）、`cdnHealth.failures`、
-`slowSamples`、Watchdog 換節點斷路器——而且彼此會**升級**（軟隔離累積 → 黑名單；
-失敗 2 次 → 黑名單；HARD 狀態碼 → 黑名單 ＋ 死節點）。這套設計預設候選池夠大，
-移除一個節點的代價很小。
+**怎麼驗證這一版有沒有用**
 
-但台灣環境的實際候選池是 **3 個**（`aliov` / `ali` / `cos`；`cosov` 被排除，
-`hwov` / `hz-aliov` 是 NXDOMAIN，`hw` 的 TCP 握不完），而且**極度不對稱**：
-curl 實測 TTFB `aliov` ~70ms、`ali` ~560ms、`cos` ~1000ms。也就是說
-(1) 任何一次處分就砍掉三分之一的池子，(2) 七套機制疊加使得幾乎總有節點在處分中，
-(3) 就算換成功了，第二名也比第一名慢 8 倍——**換節點在這個環境幾乎必然是降級**。
+- PCDN 那組：`BiliCDN.diag()` → `改寫統計` → 看 `pcdnSkipped` 是否在增加。
+- 速度判斷那組：播放時 `BiliCDN.diag()` 的 `軟隔離（session）` 應該長時間維持空白；舊版在緩衝略低於門檻時會反覆把節點丟進去。
+- 碼率誤判：找一支**有 4K 選項但只看 1080p** 的長片播 10 分鐘，之後看 `軟隔離（session）` 清單。舊版通常會累積好幾個節點，新版應該是空的。
+- DNS 那組：**健康節點的探測不該再產生任何 console 紅字**——舊版每輪對每個節點打 `favicon.ico` 必定 403/405，現在打 `crossdomain.xml` 回 200。Network 面板篩 `crossdomain` 可以看到探測請求本身（每個節點每輪 1 個，不是 2 個）。真的連不到的節點仍會紅一次，出現當下 `BiliCDN.diag()` 的死節點清單應該立刻多出那個 host（reason `DNS` 或 `DNS-segment`），之後 30 天內不再出現；若同一個 host 每隔幾天就再紅一次，代表標死沒有被持久化，那是 bug。
+- 起播路徑的浪費：F12 → Network → 開影片頁 → 看載入最前面那段有沒有一堆對不同 `upos-*.bilivideo.com` 的 `favicon.ico` 請求。新版對「已經用過一陣子」的使用者應該一個都沒有（延後到緩衝建立之後才跑）；preconnect 的 host 數量應該是 3 個而不是 6 個。
+- 遇到慢片時的通用排查：F12 → Network → 篩 `m4s` → 看第一個請求。403/404 後面跟著同路徑不同 host 的重試＝改寫改壞了（本版應已修掉）；200 但 Waiting/TTFB > 1 秒＝節點沒快取正在回源（見下面 `og` 議題）；200、TTFB 短但下載慢＝單純頻寬/節點壅塞，屬正常，腳本會自己切。
 
-**（此結論隨即被修正，見下一節。）** 當時的建議是「固定最快的節點」
-（`BiliCDN.setCdn(...)`），但那是**針對單一台機器實測結果**的結論——這是一份要發布給
-其他使用者的腳本，別人的電信商 / 路由 / 是否掛 VPN 都不同，把某個 host 寫死給所有人
-是錯的方向。正確的一般解是讓**懲罰力道跟候選池大小成比例**，見下一節。
-`setCdn()` 仍然保留為使用者層級的手動選項，但不作為預設建議。
+### 已知未處理項目
 
-**懲罰力道要跟候選池大小成比例（2026-08-19，發布版的正確一般解）**
+**已知未處理項目**（需實測才能決定）
 
-> 使用者指出上一節的結論不能用：「僅針對我目前這台電腦的狀況而已，我這是要面向其他使用者」。
-> 完全正確。把 `aliov` 寫死等於把一台機器的實測結果強加給所有人——別人的電信商、路由、
-> 是否掛 VPN 都不同，而這份腳本的整個價值就在於**它會自己學出每個人網路上最快的節點**。
-> 真正該修的不是「選哪個節點」，而是「懲罰機制假設了一個不存在的大池子」。
+- **依 `og` 參數選對應 mirror**：`og` 對應的通常是中國境內 mirror（ali/cos/hw），命中快取機率高，但從台灣連過去的線路品質不一定比海外 `ov` 節點好。是「有貨但線路遠」對上「線路好但可能沒貨」，沒實測數據不能賭。影響：熱門片幾乎無差；冷門/舊片首段可能仍多等 0.5~3 秒。
+- ~~**放寬候選池**~~ → **已完成（2026-08-20 定案）**。`alib` / `ali02` / `bos` / `tf-all-tx` 經實驗 4 驗證並經實機確認零錯誤，已加入清單，**候選池 3 → 7**。`cosov` 一度解除排除但被實機推翻（實驗 5），維持排除。`INITIAL_DEAD_HOSTS_TW`（hwov / hw / hz-aliov）維持不變，那三個是 NXDOMAIN 或 TCP 握不完，且仍保留「本機成功過一次就自動解除推定」的路徑。
+- **4K 強制不用 Akamai**：`preferWhitelistPrimary`（bandwidth > 12M 或 height ≥ 2160）會把 Akamai 從 primary 拉下來。Akamai 在台灣有時解析到美國 IP、有時很快，純調參。影響：部分 4K 片起播可能變慢。
+- **保留原始 URL 當保命 backup**：原本要做，實作到一半判定**幫助有限**——播放器只在「硬失敗」時才跳 backup，對「連得上但很慢」完全沒用，而主要症狀正是慢。加了只是徒增複雜度（還要在 `sanitizePlayInfoUrls` 與 `normalizeMediaUrl` 兩處各加白名單保護）。
+- **`reorderCdnsByLatency` 的前段排序看似被覆蓋**：檢查後確認**不能刪**——它決定 `activeCdnList` 的 index 順序，而 `getHealthyCdnList()` 在「所有節點都沒有樣本」時正是用 index 排序。（誤判，已排除）
 
-- 修正：`addToBlacklist()` 加上與候選池大小連動的煞車。黑名單是 **24 小時**的重罰，這個設計預設池子夠大、關掉一個的代價很小；但升級門檻只是 `cdnFailCount >= 2`，而台灣環境的實際可用候選常常只有 3 個。也就是說**一次 Wi-Fi 斷線或 VPN 重連，就能讓每個正在使用的節點各記 2 次失敗，把整個池子一次關光**，接下來 24 小時無節點可用。新增 `MIN_USABLE_POOL = 2` 與 `countUsableCandidates()`：若關掉這個之後可用節點會少於門檻，就**不關**，降級成一次軟隔離（現在的軟隔離是真的會到期的，見上一節）。「這個節點目前表現不好」仍然被表達出來——選路會排開它——但不會演變成「整天都沒有節點可用」。
-  這條規則**與使用者的網路環境無關**：不管誰的機器上哪一台最快，池子見底時的正確反應都是「降級處分」而不是「繼續關人」。實測驗證：連續對三個節點各觸發一次黑名單，舊版會全關 24 小時，新版最多關到剩 2 個可用。
+---
 
-**關於 `upos-sz-mirroraliov` 是不是「一個節點」**：不是，它 CNAME 到 `queniuaa.com`、8 個 A 記錄、TTL 3 秒——`setCdn()` 固定它不等於綁死單一台機器。詳見下面的〈實驗記錄〉實驗 3。
-
-**查證後確認**不是**問題的（一併記錄，免得下次又追一輪）**
-
-- `最低需求 Mbps: 27.17`（使用者在 `diag()` 看到，懷疑是碼率誤判沒修好）——**是正常的暫時值**。`setStreamProfile` 在 playurl 當下先用清單最高畫質（`maxV + maxA`）當初估，之後由 `syncStreamBitrateFromVideo()` 在 Watchdog `tick()` 裡用 `videoEl.videoHeight` 校正成實際播放的畫質；而 `videoHeight` 在影片解出第一張畫面之前是 `0`，此時函式會直接 `return` 維持初估值（刻意的：寧可高估也不要低估到讓 Watchdog 對真正的卡頓變遲鈍）。沙箱重現：清單含 4K(25.4M)+1080p(3.0M)+720p(1.2M) 與音訊 0.5M 時，校正前是 **27.20 Mbps**（與使用者看到的 27.17 幾乎完全相同），餵進 `videoHeight = 1080` 之後降到 **3.68 Mbps**；餵 `videoHeight = 2160` 則維持高門檻，餵 `0` 維持初估值。**判讀方式：要看這個數字對不對，必須在影片「已經播出畫面」之後才執行 `diag()`**，在起播前或暫停於黑畫面時看到 4K 等級的數字是預期行為。
-
-**不是本腳本造成的 console 訊息（一併記錄，省得下次再追一輪）**
-
-- `[Violation] Permissions policy violation: unload is not allowed in this document.`（來源 `video.*.js` 的 `reportPerformance`）——Bilibili 自己的效能回報程式在用已被 Chrome Permissions-Policy 停用的 `unload` 事件。與本腳本無關，也不影響播放。
-- `api.bilibili.com/client_info?type=json` 回 **404**——Bilibili 自己的端點，本腳本不攔截也不改寫 `client_info`（`isPlayUrlApi()` 只匹配 `/player/*playurl`）。與本腳本無關。
+### 附錄 A：實驗記錄
 
 **實驗記錄（2026-08-19，台灣網路環境）**
 
@@ -366,65 +430,6 @@ NXDOMAIN、`bdov` TLS 失敗、`cosov` 見下。
 > （這裡是 Resource Timing），(3) 一個物理合理性檢查（跨境延遲不可能是個位數毫秒）。
 > 三者缺一，就可能像前三次一樣得到看起來很漂亮、實際上完全錯誤的結論。
 
-**實驗 5：cosov 回退，與「多開分頁不穩定」（2026-08-20 實機回報）**
-
-> 使用者重貼後回報：console 又有紅字，而且**多開 bilibili 分頁會造成不穩定**。
-> 兩份 log 逐行清點的結果：**所有錯誤都來自 cosov**，上一輪新增的其他四個鏡像
-> （`alib` / `ali02` / `bos` / `tf-all-tx`）**零錯誤**。
-
-- 回退：`ExcludeHostKeywords` 預設改回 `['cosov']`。**實驗 4 的結論範圍下錯了。**那個實驗證明的是「cosov 能服務一次 16KB 的 range 請求」，我卻拿它推論成「cosov 可以當候選節點」。實機打臉的兩種方式：
-  1. **探測必定 403**：`PROBE_PATH` 是 `/crossdomain.xml`，而實驗 2 早就量到 cosov 對這個路徑回 403。把它放進候選池，等於保證每一輪探測都固定產生一行紅字——這是我在實驗 2 的表格裡寫下、卻在做決策時沒有回頭看的資料。
-  2. **真實播放會失敗**：`ERR_FAILED 514`，且回應**不帶 `Access-Control-Allow-Origin`**，瀏覽器直接報 CORS 錯誤（實測 URL 是 `os=cosovbv`、`bw=22M` 的 4K/HDR 串流）。一次 16KB 的小範圍請求量不到這個。
-  `cosov` 仍保留在 `PREFERRED_CDN_LIST_RAW` 裡，想自己實驗的人 `BiliCDN.include("cosov")` 就能放行，不必改原始碼。
-- 修正（**多開分頁不穩定的主因**）：`lastBakeoffAt` 是**純記憶體變數**，於是每個分頁各跑一場獨立的吞吐量賽馬——每場最多 4 顆候選 × 最多 768KB、每 90 秒一輪。開 5 個分頁就是 5 倍的背景流量在跟正在播的影片搶頻寬。
-  值得注意的是**既有的跨分頁機制擋不住這個**：`runThroughputBakeoff` 已經有 Web Locks（`ifAvailable`）與 BroadcastChannel 心跳，但那兩者擋的是「**同時**」，不是「**頻率**」——A 分頁測完釋放鎖，B 分頁的 90 秒冷卻是它自己記憶體裡的 `0`，於是立刻接著測，C 分頁再接著測。N 個分頁只是把 N 場賽馬**排隊跑完**，總流量一點都沒省。
-  修法：冷卻時間戳改存 GM storage（`lastBakeoffAt_v1`），所有分頁共用，真正收斂成「每 90 秒全域一場」。賽馬結果本來就寫進共用的 `cdnHealth`，所以同一個時間窗內只需要一個分頁去測。時間戳在 `doBakeoff()` 開頭就先寫入（不是跑完才寫），避免兩個分頁同時通過檢查的競爭窗口。
-
-> **這一輪的教訓**：實驗結論的**適用範圍**要跟實驗設計一樣嚴格地寫下來。
-> 「一次 16KB range 請求回 206」和「這個節點可以拿來播影片」之間差了：持續傳輸、
-> 大位元組數、高碼率/HDR 串流、以及探測路徑本身的行為。我在同一份文件的實驗 2
-> 就記下了「cosov 對 /crossdomain.xml 回 403」，做決策時卻沒有回頭交叉比對——
-> **有記錄不等於有用到記錄。**
-
-**全面稽核：把「腳本自己會製造的 console 錯誤」逐類清掉（2026-08-20）**
-
-> 目標訂得很明確：**主控台不該出現任何本腳本造成的錯誤**。做法是把「腳本會發出的請求」
-> 與「腳本會產生的例外／拒絕」兩類來源逐一列舉、逐一驗證，而不是等使用者回報再追。
-
-- 修正：**HTTPDNS 阻擋會製造 `Uncaught (in promise)`**。`fetch` 那條路是 `Promise.reject(new DOMException(...))`，但我們**不控制呼叫端**——B 站的 HTTPDNS 客戶端若沒有 `.catch()`，被拒絕的 promise 就會在 console 留下一行紅字。阻擋機制本身不該是噪音來源（跟探測路徑改用 `/crossdomain.xml` 同一個原則）。fetch 沒有「不 reject 的網路錯誤」可用，所以改成**合成一個失敗回應**：503 + 合法 JSON body，同時滿足「檢查 `res.ok`」與「直接 `res.json()`」兩種客戶端寫法，且不會二次拋錯。合成的 Response 沒有經過網路層，瀏覽器不會有任何 network entry 或 console 輸出。對照組：XHR 那條路本來就是補送 `error` + `loadend` 事件（XHR 的 error 事件不印紅字），這次是讓 fetch 對齊它的行為。
-- 修正（**狀態持久化不完整**，兩個欄位）：`probeSlows`（2026-08-19 新增）在 `ensureCdnHealth` 預設值、存檔 payload、載入器**三處都沒有接上**；`probeTimeouts`（既有）則是**有寫入存檔卻從未被讀回**，是個只寫不讀的欄位。後果一樣：兩個「連續 N 輪才定罪」的 strike 計數**只在單一頁面 session 內成立**，重整一次就歸零——而探測最快兩小時才跑一輪，等於門檻永遠達不到，機制形同虛設。三處一起補齊，載入時用小上限夾住避免殘留異常值一載入就定罪（上限寫字面量而非引用 `PROBE_*_STRIKES`，那兩個常數定義在檔案更後面，載入期引用會踩 TDZ）。
-- 查證後確認**沒有問題**：`cdnHealth` 的跨分頁合併**早就實作了**（`scheduleCdnHealthSave()` 存檔前先讀回 GM 最新內容，逐 CDN 以 `lastSeen` 較新者為準）。前一節把它列為「待處理」是誤判——從「共用儲存 + 整包寫入」這個模式直接推論，而沒有先讀那段程式碼。
-- 稽核結果（無需修改）：全檔無死碼（本批新增的 15 個符號全部有被引用）；沒有漏接 `.catch` 的自有 promise 鏈；`err()` 預設被 `Config.verbose`（false）擋住；只有 3 處未經 verbose 把關的 `console.error/warn`，分別只在「CustomCDN 填了非法網域」「Worker module import 失敗」「`revive()` 傳入不存在的 host」時觸發，正常使用不會出現。
-
-**驗證方式**
-
-- 新增 `tests11.js`：把**每一個對外 API** 與媒體 URL 的攔截路徑都跑一遍，並在 **`ok` / `fail` / `403` 三種網路模式**下各跑一次（沙箱的 fetch/XHR 樁可切換成全部拒絕或全部 403），斷言**零未捕捉的 rejection、零例外**。含「全部節點都死」的極端狀態。
-- 新增 `tests12.js`：驗證狀態持久化的三處一致性，含「存檔後再讀回不遺失」與「較新的另一分頁資料不被覆寫」。
-- 12 套測試共 **212 項，連跑 3 輪全部 0 失敗**；`tests11` 另外在 3 種網路模式下各 38 項全過。
-- 用 curl 重新確認 7 個候選節點的探測路徑**全部回 200**（cosov 對照組確認仍是 403，證明排除正確）。過程中量到 `upos-sz-mirrorali` 是**間歇性黑洞**（4 輪裡 1 輪 TCP 完全連不上、15 秒無回應，其餘 3 輪 0.56~0.77s 正常），且它的 IP 段一天內從 `221.178.37.x` 換成 `116.77.74.x`——這正是 8 秒探測窗 + 10 秒確認 + 連續 3 次才判死的設計要吸收的情況，且我們的 abort 一定早於 Chrome 自己的 TCP timeout，不會留下紅字。
-
-> **能保證與不能保證**：腳本**自己發出的請求**現在全部指向已實測回 200/206 的端點，
-> 且不會產生未捕捉的 rejection——這部分可以保證。但**不能保證 console 永遠乾淨**：
-> 被改寫後的 segment 請求若打到當下正好故障的節點（如上述 ali 的間歇性黑洞），
-> 瀏覽器仍會記錄該次失敗，那是任何 CDN 都可能發生的事，只能靠健康評分把它排開。
-
-**綁定節點的串流：`os=<節點>bv` 換 host 必定 403（2026-08-20 實機回報「十分不穩定」）**
-
-> 使用者回報極度不穩定並附上完整 log。關鍵線索藏在 URL 的參數裡：那條 segment 網址帶
-> **`os=cosovbv`**，而賽馬把同一條 URL 換到 `aliov` / `ali` / `cosov` 三台——**三台全部 403**。
-
-- 修正（**本輪最重要**）：Bilibili 有一類 playurl 簽發的網址是**綁定特定節點**的，URL 上帶 `os=<節點>bv`，**換掉 host 之後每一台都回 403**。這造成兩層傷害：
-  1. **賽馬每 90 秒製造 3~4 行紅字**——`probeCdnThroughput` 把 403 吞成 `null`，所以賽馬分不出「這節點慢」和「這條網址誰都不給」，於是逐一把剩下的候選全試一遍，每顆各留一行 403。
-  2. **正常播放也被改壞**——`transformStreamItem` / `normalizeMediaUrl` 照樣改寫，播放器拿到 403 只能一路重試 `backup_url`，表現出來就是「十分不穩定」。
-  
-  **沒有辦法在事前可靠判斷**（實測過 `os` 是別的值時換 host 完全可行，並非全部綁定），所以改成**學習**：任何一次「換 host 之後拿到 403」就把這條串流登記進 `hostLockedStreams`，之後對它完全不改寫、也不賽馬，交還播放器用 B 站原本給的網址跑。學習的觸發點有兩個——賽馬的 403，以及**播放層被我們改寫過的 segment 拿到 403**（只在有改寫時才登記；沒改寫過的 403 是節點自己的問題，不是綁定）。
-  
-  key 優先用 `os` 參數（同一支影片的各種畫質共用同一個 `os`，**一次學習全部畫質適用**），沒有 `os` 才退回 pathname。守門放在 `replaceUrlHost()`——所有改 host 的唯一出入口，跟 PCDN 守門同一處，playurl 層與 transport 層一次涵蓋。SPA 換片（`resetStreamProfile`）與 `BiliCDN.reset()` 都會清空，新影片重新給機會。
-- 修正：`probeCdnThroughput()` 現在把 403 明確回報（`{ forbidden: true }`）而不是吞成 `null`；`doBakeoff` 收到第一個 403 就**登記並立刻中止本輪**，不再逐一試完剩下的候選。`runThroughputBakeoff` 入口也先檢查一次，已知綁定的串流連 Web Locks 都不用搶。
-- 新增：診斷的 `改寫統計` 多一個 `hostLocked` 欄位——數字 > 0 代表你遇過綁定節點的簽名。長期為 0 表示你的環境沒碰到這類串流。
-
-> **這一輪的教訓**：`probeCdnThroughput` 把所有失敗都壓成 `null`，是「**把不同的失敗原因抹平成同一種**」的典型代價。慢、逾時、DNS 失敗、403 需要完全不同的反應（重試 / 降級 / 標死 / **停止對整條串流動手**），而一旦在最底層就丟掉了區別，上層就只能一視同仁地繼續試下去——每試一顆多一行紅字。回報失敗時，**先問「呼叫端會因為知道原因而做出不同決定嗎」**，會的話就不能只回 null。
-
 **貫穿全部實驗的方法論教訓**
 
 - 量測的前提條件要跟「用它做的判斷」一起檢查：暖機值 vs 冷路徑、有回應 vs 可用、
@@ -432,14 +437,52 @@ NXDOMAIN、`bdov` TLS 失敗、`cosov` 見下。
 - 用輕量請求代替真實請求之前，先問「我讀得到我要判斷的那個訊號嗎？」——`no-cors` 讀不到
   狀態碼，959（區域拒絕）看起來就跟 200 一樣。
 - 在有攔截層的環境裡做網路實驗，先確認**實驗本身沒有被攔截層改寫**，並保留對照組。
+
 **測試環境限制（重要，會影響下一輪怎麼驗）**
 
 - **在 claude-in-chrome / CDP 驅動的分頁裡，bilibili 播放器不會起播**：`video.readyState` 恆為 0、`duration` 為 `null`、`buffered.length` 為 0，畫面全黑顯示 `00:00 / 00:00`。試過 5 支影片、重整、實際點擊給 user gesture 都一樣。**已排除是腳本造成的**——決定性 A/B 是在頁面內跑 `BiliCDN.exclude('upos')`（把整份白名單排掉 ⇒ `activeCdnList` 清空 ⇒ `replaceUrlHost()` 沒有改寫目標 ⇒ 等同停用改寫），再 SPA 換片，症狀完全相同；而且直接 `fetch` playurl 給的 `base_url` / `backup_url` 都回 **206 + 65536 bytes**，節點與簽名都是好的。另外那個環境的 `setTimeout` / XHR 回呼在 eval 之間不會推進，fire-and-forget 式的量測全部拿不到結果。
 - 後果：**起播速度、seek 流暢度、緩衝顯示這三類「要真的播得動才能量」的項目，無法用瀏覽器自動化驗證**，只能由使用者在自己的一般 Chrome 視窗操作。同理，「`alib` / `ali02` / `bos` / `tf-all-tx` 能不能服務真實的簽名 m4s」也還沒驗過——`/crossdomain.xml` 回 200 只證明 host 活著，不證明它認得別台簽的 upos 路徑。**在驗過之前不要把它們加進 `PREFERRED_CDN_LIST_RAW`。**
 
+### 附錄 B：開發過程中被推翻或排除的判斷
+
+**設計層面的結論（回答「這是不是最優解」）**
+
+> 程式碼層面：目前每一個已知缺陷都已修正，125 項行為斷言全通過，console 零紅字。
+> 但要誠實指出一個**設計與實際選擇空間不匹配**的問題，它不是 bug，改不改是取捨：
+
+本腳本有 **7 套彼此重疊的懲罰機制**——持久死節點（1/7/30 天）、黑名單（24 小時）、
+軟隔離（2~10 分鐘）、`cdnFailCount`（2 次即升級黑名單）、`cdnHealth.failures`、
+`slowSamples`、Watchdog 換節點斷路器——而且彼此會**升級**（軟隔離累積 → 黑名單；
+失敗 2 次 → 黑名單；HARD 狀態碼 → 黑名單 ＋ 死節點）。這套設計預設候選池夠大，
+移除一個節點的代價很小。
+
+但台灣環境的實際候選池是 **3 個**（`aliov` / `ali` / `cos`；`cosov` 被排除，
+`hwov` / `hz-aliov` 是 NXDOMAIN，`hw` 的 TCP 握不完），而且**極度不對稱**：
+curl 實測 TTFB `aliov` ~70ms、`ali` ~560ms、`cos` ~1000ms。也就是說
+(1) 任何一次處分就砍掉三分之一的池子，(2) 七套機制疊加使得幾乎總有節點在處分中，
+(3) 就算換成功了，第二名也比第一名慢 8 倍——**換節點在這個環境幾乎必然是降級**。
+
+**（此結論隨即被修正，見下一節。）** 當時的建議是「固定最快的節點」
+（`BiliCDN.setCdn(...)`），但那是**針對單一台機器實測結果**的結論——這是一份要發布給
+其他使用者的腳本，別人的電信商 / 路由 / 是否掛 VPN 都不同，把某個 host 寫死給所有人
+是錯的方向。正確的一般解是讓**懲罰力道跟候選池大小成比例**，見下一節。
+`setCdn()` 仍然保留為使用者層級的手動選項，但不作為預設建議。
+
+**查證後確認**不是**問題的（一併記錄，免得下次又追一輪）**
+
+- `最低需求 Mbps: 27.17`（使用者在 `diag()` 看到，懷疑是碼率誤判沒修好）——**是正常的暫時值**。`setStreamProfile` 在 playurl 當下先用清單最高畫質（`maxV + maxA`）當初估，之後由 `syncStreamBitrateFromVideo()` 在 Watchdog `tick()` 裡用 `videoEl.videoHeight` 校正成實際播放的畫質；而 `videoHeight` 在影片解出第一張畫面之前是 `0`，此時函式會直接 `return` 維持初估值（刻意的：寧可高估也不要低估到讓 Watchdog 對真正的卡頓變遲鈍）。沙箱重現：清單含 4K(25.4M)+1080p(3.0M)+720p(1.2M) 與音訊 0.5M 時，校正前是 **27.20 Mbps**（與使用者看到的 27.17 幾乎完全相同），餵進 `videoHeight = 1080` 之後降到 **3.68 Mbps**；餵 `videoHeight = 2160` 則維持高門檻，餵 `0` 維持初估值。**判讀方式：要看這個數字對不對，必須在影片「已經播出畫面」之後才執行 `diag()`**，在起播前或暫停於黑畫面時看到 4K 等級的數字是預期行為。
+
+**不是本腳本造成的 console 訊息（一併記錄，省得下次再追一輪）**
+
+- `[Violation] Permissions policy violation: unload is not allowed in this document.`（來源 `video.*.js` 的 `reportPerformance`）——Bilibili 自己的效能回報程式在用已被 Chrome Permissions-Policy 停用的 `unload` 事件。與本腳本無關，也不影響播放。
+- `api.bilibili.com/client_info?type=json` 回 **404**——Bilibili 自己的端點，本腳本不攔截也不改寫 `client_info`（`isPlayUrlApi()` 只匹配 `/player/*playurl`）。與本腳本無關。
+
+### 附錄 C：資訊來源與可信度
+
 **資訊來源與可信度**
 
 `og` / `os` / `/v1/resource` 等 Bilibili CDN 內部行為**沒有任何官方文件**，本版依據的是社群逆向工程整理（linux.do 技術貼、ReVanced 漫游模組原始碼、Bilibili-Evolved issue 討論）。CDN 分類共四型：Mirror（商業 CDN，最好）、UPOS/estg（物件儲存，冷門片常見，要回源）、BCache（自建機房，品質因地區而異）、MCDN/PCDN（最差）。邏輯上合理且與實際症狀吻合，但**非官方或學術來源**；反方說法也存在，有海外使用者回報「換成國內節點反而更順」，代表節點好壞的地區差異極大。**任何時候你自己實測的數據都優先於任何清單。**
+
 
 ## v1.3.1
 

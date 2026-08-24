@@ -1,5 +1,172 @@
 # Changelog
 
+## v1.3.4
+
+> 本版起因是一則使用者回報：`https://www.bilibili.com/list/*` 必須自己在 Tampermonkey
+> 加「自訂 matches」才能載入腳本。順著查下去發現的不只是漏掉一條 `@match`，而是**同一個
+> 疏漏的兩層後果**——列表頁沒被載入（一），以及就算載入了，換片偵測也認不出列表頁的影片
+> （二，影片編號在 `?bvid=` 而不是路徑裡）。修完再把「認不出這是哪部片」從靜默失敗改成會
+> 出聲（三），並藉主動巡檢一併修掉攔截層四個「平常不會發生、一發生就很嚴重」的問題
+> （四，R-1～R-5，非使用者回報；其中 R-5 是 v1.3.3 一項修正的實機回退）。
+>
+> 一般影片頁的行為零變化，已離線驗證。
+
+**本版導覽**
+
+- 一、播放頁涵蓋範圍（`@match`）
+- 二、換片偵測支援 query 型頁面
+- 三、把靜默失敗改成會出聲
+- 四、攔截層健壯性（主動巡檢）
+- 離線驗證結果
+- 實機迴歸測試清單
+- 本次刻意不做的事
+- 巡檢中「看過但不改」的項目
+
+---
+
+### 一、播放頁涵蓋範圍（`@match`）
+
+- 修正：`@match` 清單缺少 `/list/*`——稍後再看、收藏夾播放、UP 主合集／系列的連續播放頁全部走這個網址，腳本**根本不會被載入**。回報者只能自己在 Tampermonkey 的「使用者包含規則」手動補一條當暫時解法，那是個人端補丁，對其他人無效。一併補上同類遺漏的 `/festival/*`（跨年晚會、拜年紀等活動播放頁，走同一套 playurl API）、`/medialist/play/*`（舊版收藏夾播放頁，現多會轉址到 `/list/`，但舊連結仍在流通）、`/watchlater/*`（舊版稍後再看，保險性質）。
+- 說明：`@match` 的萬用字元 `*` 會一併涵蓋問號後的 query string，所以 `/list/*` 能正確匹配 `…/list/watchlater?oid=…`，不需要額外規則。
+- 說明：**為什麼只補 `@match` 就會動**——v1.3.3 已經拿掉內部那道寫死的 `isVideoPage` 閘門（見原始碼「以下 UI / Watchdog / Prewarm 過去用一個寫死的 isVideoPage…」那段註解），所以目前唯一擋住這些頁面的就只有中繼資料這一層。
+
+### 二、換片偵測支援 query 型頁面
+
+- 修正（**本版最重要**）：`getVideoKey()` 只翻 `location.pathname`，但影片識別碼有兩種存放位置——**pathname 型**（`/video/BV1xx…`、`/bangumi/play/ep123`，編號寫在路徑裡）與 **query 型**（`/list/`、`/festival/`、`/medialist/`，pathname 從頭到尾都是 `/list/watchlater` 這種固定字串，換片只改 `?bvid=` / `?oid=`）。結果是在列表裡連播十部片，`getVideoKey()` 十次回傳同一個值，`onSpaNavigate()` 在第一行 `if (key === currentVideoKey) return` 就掉頭走人，於是 `forcedRedirectHosts` 不清除（上一部片的強制改寫套用到新片）、`resetStreamProfile()` 不執行（新片沿用上一部的碼率判斷）、`setLastBakeoffAt(0)` 不執行（賽馬冷卻沒解除，新片無法立即重新選節點）、`Watchdog.reset()` / `rearmSeekPrewarm()` 不執行（卡頓判斷與 seek 預熱狀態殘留）。改成 pathname 優先、query 補位：`m` 沒中才依序看 `bvid` / `epid` / `oid` / `aid`，其中 `oid` / `aid` 是 av 號的數字部分，補上 `av` 前綴，讓同一部片不論從哪種頁面進來都收斂到同一個 key。順手把重複建立的 `URLSearchParams` 收斂成一個 `sp` 變數。
+- 說明：**行為相容性**——`m` 永遠優先，所以 `/video/`、`/bangumi/play/` 等 pathname 型頁面的結果與 v1.3.3 逐字元相同（已離線驗證，見下）。v1.3.3 修正的「多 P 影片切換分集只改 `?p=`」也原封保留。
+
+> **這一輪的教訓**：這與 v1.3.3 修的「多 P 只改 `?p=`」是**同一種病**——判斷式沒跟上新的網址型態，而且**失敗時完全沒有跡象**。v1.3.3 當時是留了一段註解提醒自己，事實證明「寫下來提醒自己」擋不住同類問題再犯一次；真正有效的防線是下面第三節那種會自己出聲的機制。
+
+### 三、把靜默失敗改成會出聲
+
+- 新增：`warnIfVideoKeyUnresolvable()`——`getVideoKey()` 的 `|| location.pathname` 是個**靜默退路**：拿不到影片編號時不報錯，還回傳一個看起來很合理的值，整個換片偵測已經失效卻不留任何跡象，只能等使用者回報「怪怪的」。這正是本次問題拖到現在才被發現的原因。改成兩種來源都落空時在 console 印一則警告（每個分頁只印一次）。
+- 說明：三個刻意的設計決定——(1) **不受 `Config.verbose` 控制**，用 `console.warn` 直接輸出（與既有的 CustomCDN 安全警告同理由）：要靠它主動現身，就不能藏在預設關閉的開關後面。(2) **只在 `onSpaNavigate()` 呼叫，不在 `getVideoKey()` 內呼叫**：頁面剛載入時 `/list/watchlater` 可能還沒帶上 `?bvid=`（B 站隨後才 pushState 補上），在 `getVideoKey()` 裡呼叫會產生誤報；「發生過 SPA 導覽卻仍認不出影片」才是真正的問題訊號。(3) **呼叫點必須在 early return 之前**：失效的症狀正是 key 一直不變、每次都從 `if (key === currentVideoKey) return` 那行離開，放在後面等於永遠不會執行。
+- 說明：用 `warn` 而非 `error`，訊息中寫明「CDN 改寫本身不受影響，影片仍會正常播放」——這是給回報用的線索，不是故障，不需要讓一般使用者緊張。
+- 說明：**已知涵蓋範圍（誠實說明）**——這則警告涵蓋的是「`@match` 有涵蓋、但網址型態不認得」的情況。**「`@match` 根本沒涵蓋」的新頁型，腳本不會被載入，任何自檢機制都偵測不到**，只能靠使用者回報，也就是本次的情況。這是設計上的天花板，不是疏漏。
+
+### 四、攔截層健壯性（主動巡檢）
+
+> 修完上述問題後對全檔做了一次系統性巡檢：ESLint 靜態檢查（no-undef / no-unused-vars /
+> no-dupe-keys / no-unreachable 等）**零錯誤**，人工審視則在網路攔截層找到四個問題。
+> 四項都屬於「平常不會發生、一發生就很嚴重」的類型，且修正方向都是單向的（失敗時退化成
+> 「不優化」而非「壞掉」），因此一併納入本版。**非使用者回報。**
+
+- 修正（R-1，嚴重）：`unsafeWindow.fetch` 攔截 playurl 時，原本包了一層 `new Promise(resolve => response.text().then(text => resolve(...)))`——那個 executor **沒有 reject 參數**。`response.text()` 只要 reject，內層的 rejection 就無處可去（瀏覽器印一行 `Uncaught (in promise)`），而外層 Promise **既不 resolve 也不 reject**——呼叫端的 `await fetch(...)` 永遠不會回來，播放器停在「載入中」，只能重整頁面。觸發條件：fetch 的 promise 在**收到 header** 時就 resolve，body 還在傳；所以「header 已到、body 中斷」這個窗口內發生連線中斷，或播放器把這次 playurl 請求 abort 掉（快速連續換片、連點畫質切換），就會踩到。症狀對得上先前回報的「偶爾有幾部影片點進去一直轉圈」。改成拿掉多餘的 `new Promise` 包裝，直接回傳 `.then()` 鏈，讓 rejection 照 Promise 語意往外傳，播放器的錯誤處理與重試才有機會運作。同時補上 `204 / 205 / 304` 的 null body 處理（依規範這些狀態碼不得帶 body，硬塞會讓 `Response` 建構子丟 TypeError），以及「改寫丟例外就退回原始 text」「連合成 `Response` 都失敗就交回最小回應」兩層退路。
+- 修正（R-2，嚴重）：`applyPageHooks()` 裡的四個 hook 原本是裸呼叫，而 `applyPageHooks()` 本身在 Main IIFE 頂層被直接執行——任何一個丟出例外，後面三個不會安裝、`pageHooksApplied` 停在 `false`，例外再往上炸掉整個 IIFE，於是**它後面的所有東西**（SPA 換片偵測、Watchdog、seek 預熱、設定面板、Tampermonkey 選單）全部不會執行。一個小失誤的爆炸半徑不該是整支腳本。改成逐項用 `try/catch` 隔離，壞一個只少一個功能。
+- 修正（R-3，嚴重）：`__playinfo__` 的 setter 舊寫法是 `set: v => { playInfoTransformer(v); internal = v }`，而 `playInfoTransformer` 的前半段（`playInfo.result` 分支，含 `sanitizePlayInfoUrls` 與 `transformStreamItem` 呼叫）**不在它自己的 try/catch 範圍內**。一旦丟出例外，`internal = v` 就不會執行——頁面明明寫入了 `__playinfo__`，讀回來卻是 `undefined`，播放器拿不到初始播放資訊；例外還會往回炸進 B 站自己的 inline script。改成把改寫包進 `safeTransform()`，無論成敗都保證 `internal = v`。搭配 R-2，攔截層任何一處失敗最多只是「這次不優化」，不會讓影片播不出來。
+- 修正（R-4，中）：三個回應處理的邊界問題。(1) `if (response === null) return true`——攔截器鏈的規則是「回傳值只要不是 `undefined` 就當成新的回應內容」，所以這行等於把回應**換成布林值 `true`**；改成回傳 `undefined`，語意才是「這次不改寫」。(2) XHR 若設了 `responseType='json'`，`super.response` 拿到的是**已解析的物件**而不是字串，舊寫法一律 `JSON.parse(物件)` → 被強制轉成 `"[object Object]"` → 丟 SyntaxError → 落到 catch → 整包回應原封不動送出；也就是走這條路徑的 playurl **從來沒有被改寫過**，而且完全無聲無息。改成先判型別，物件就地改寫後回傳同一個參考。(3) 攔截器鏈 `handleInterceptedResponse` 的 handler 呼叫補上 `try/catch`——這個函式是從 `responseText` / `response` 的 **getter** 裡呼叫的，讓例外往外傳等於播放器讀一次屬性就踩一次 `throw`。
+- 待確認：R-4 的第 2 點是否真的會被觸發，取決於 B 站的播放器實際用哪條路徑取 playurl。修正本身是單向安全的（原本不會改寫 → 現在會改寫；型別不符時行為與過去相同），但**改寫是否真的生效需要實機確認**：在 `/video/` 頁切換畫質，看 `BiliCDN.diag()` 的改寫計數有沒有增加。
+- 修正（R-5，中，**v1.3.3 一項修正的回退**）：HTTPDNS 阻擋的 XHR 路徑不再補送 `error` 事件，改成合成一個 `503` + 合法 JSON 的回應。v1.3.3 為了「別讓 B 站的 HTTPDNS 客戶端空等自己的逾時」而補送 `error → loadend`，但 B 站的請求層收到 `error` 事件就 `reject()`（**不帶參數**，印出來就是 `undefined`），而那條 promise 沒有 `.catch()` —— 每一次阻擋都會在 console 留下一行 `Uncaught (in promise) undefined`。阻擋 HTTPDNS 的目的是讓它退回系統 DNS，不是在使用者的 console 留紅字——**阻擋機制本身不該成為噪音來源**。fetch 那條路早在 v1.3.3 就是這個結論（合成 503 JSON 回應），XHR 這條當時漏掉了，現在補齊，兩條路一致：對呼叫端而言這是一次「伺服器回了 503」的**正常完成**，不是網路錯誤。實作上完全不呼叫 `super.send()`（不產生任何真實請求或 network entry），也不再呼叫 `abort()`；`readyState` / `status` / `statusText` / `responseURL` / `responseText` / `response` / `getResponseHeader` / `getAllResponseHeaders` 在阻擋期間一併自圓其說，其中 `response` 依 `responseType==='json'` 回傳已解析的物件（同 R-4 第 2 點）。
+- 結案（R-5 的證據層級，誠實說明）：**R-5 不是那行紅字的解方**，它是一項原理上正確、但與該症狀無關的對稱性修正。2026-08-24 的實機取樣定案：紅字（`Uncaught (in promise) undefined`，`loadVideoData` 路徑）**出現的同時** `改寫統計.httpdns` 仍為 **0** —— R-5 修的 HTTPDNS 阻擋路徑在該次載入從未執行，卻照樣有紅字。堆疊指向的 `send @ userscript.html…:2454` 對應本檔的 `return super.send(...args)`，也就是「原封不動交給原生 XHR」那一行。加上 reject 值是 `undefined`（本腳本任何一處都不會 `reject()` 不帶參數），三項證據一致指向 B 站自己的請求層。R-5 仍保留：不主動製造 `error` 事件、與 fetch 路徑對稱，這兩點與症狀歸屬無關地成立。
+- 更正一項判別法（原先寫錯，一併記錄）：**不能**用「堆疊裡有沒有 `send @ userscript.html`」來判斷紅字是不是本腳本造成的。我們的 `send()` 覆寫包住的是**每一個 XHR**，所以任何一條經過它的請求——包含 B 站自己失敗、自己 `reject()` 的——在 async 堆疊上都會出現這個框架。它只代表「這條請求經過我們」，不代表「是我們弄壞的」。真正能區分的是 `改寫統計.httpdns` 有沒有在增加。
+
+### 離線驗證結果
+
+以 Node 直接跑新舊兩版 `getVideoKey()` 比對（一次性驗證腳本，未入版控）：
+
+| 情境 | 舊 (1.3.3) | 新 (1.3.4) |
+|---|---|---|
+| `/video/BV1xx411c7mD` | `bv1xx411c7md` | `bv1xx411c7md` |
+| `/video/BV1xx411c7mD?p=2` | `bv1xx411c7md#p2` | `bv1xx411c7md#p2` |
+| `/bangumi/play/ep123456` | `ep123456` | `ep123456` |
+| `/bangumi/play/ss12345` | `ss12345` | `ss12345` |
+| `/list/watchlater?oid=111&bvid=BV1aa…` | `/list/watchlater` ❌ | `bv1aa4y1x7zn` ✅ |
+| `/list/watchlater?oid=222&bvid=BV1bb…` | `/list/watchlater` ❌ | `bv1bb4y1x7zn` ✅ |
+| `/list/ml3344556?oid=333&bvid=BV1cc…` | `/list/ml3344556` ❌ | `bv1cc4y1x7zn` ✅ |
+| `/list/12345?type=season&…&bvid=BV1dd…` | `/list/12345` ❌ | `bv1dd4y1x7zn` ✅ |
+| `/festival/2026bnj?bvid=BV1ff…` | `/festival/2026bnj` ❌ | `bv1ff4y1x7zn` ✅ |
+| `/list/watchlater`（尚未帶片） | `/list/watchlater` | `/list/watchlater`（觸發 fallback 旗標） |
+| `/some/new/page?foo=bar`（未知頁型） | `/some/new/page` | `/some/new/page`（觸發 fallback 旗標） |
+
+- 列表內換片，舊版判定為同一部：**是**（這就是 bug）→ 新版判定為同一部：**否**（已修正）
+- 一般影片頁新舊結果完全一致：**是**（既有行為未改變）
+
+R-1 的 fetch 攔截路徑（用假的 `Response` 模擬 body 中斷）：
+
+| 情境 | 舊 (1.3.3) | 新 (1.3.4) |
+|---|---|---|
+| body 正常收到 | resolved | resolved |
+| header 已到、body 中斷 / 被 abort | **永不 settle（掛起）** | rejected（可重試） |
+| 204 無 body 狀態碼 | 會丟 TypeError（依 `Response` 建構子規範推論，測試未實跑舊路徑） | body = `null` |
+| 改寫是否仍生效 | ✅ | ✅ |
+
+R-5 的 HTTPDNS 阻擋路徑（用假的原生 XHR + B 站式 promise 包裝重現）：
+
+| 觀察項 | 舊 (1.3.3) | 新 (1.3.4) |
+|---|---|---|
+| 呼叫端 promise | `rejected`，reject 值為 `undefined` ←（這就是回報的紅字） | `resolved` |
+| 呼叫端讀到的 status / Content-Type | —（網路錯誤，沒有回應） | `503` / `application/json` |
+| `responseType='json'` 時的 `response` | — | 已解析的物件（`code = -1`） |
+| 事件觸發次數 | — | `readystatechange(DONE)` / `load` / `loadend` 各 1 次，`error` 0 次 |
+
+`node --check bilibili-cdn-tw.user.js` 語法檢查：**通過**。
+
+### 實機迴歸測試清單
+
+離線驗證只證明了 key 的計算與 fetch 路徑的 settle 行為正確，以下仍需在瀏覽器實測。
+建議先在 console 執行 `BiliCDN.verbose(true)` 再開始。
+
+**必測（本次改動直接影響）**
+
+- [ ] 開啟 `https://www.bilibili.com/list/watchlater`，確認腳本有載入（播放器設定選單裡看得到面板，或 `BiliCDN.diag()` 有輸出）
+- [ ] 在稍後再看列表裡按「下一部」，console 應出現 `[SPA] 換片：bv… 重置選節點狀態`
+- [ ] 同上，連續換 3 部片，每次都要出現該行且 key 不同
+- [ ] 開啟收藏夾播放頁（`/list/ml…`），重複上述兩項
+- [ ] 開啟 UP 主合集播放頁（`/list/{mid}?type=season…`），重複上述兩項
+
+**回歸（確認沒弄壞既有功能）**
+
+- [ ] 一般影片頁 `/video/BV…` 播放正常，面板正常，換下一部片時 `[SPA] 換片` 正常
+- [ ] 多 P 影片切換分集（只改 `?p=`）仍會觸發換片重置（v1.3.3 的修正未被破壞）
+- [ ] 番劇 `/bangumi/play/ep…` 播放與換集正常
+- [ ] 課程 `/cheese/…` 播放正常
+
+**診斷警告（第三節）**
+
+- [ ] 在 `/video/BV…` 與 `/list/watchlater` 正常換片時，**不應**出現該警告（無誤報）
+- [ ] 頁面剛載入、尚未帶 `?bvid=` 的瞬間，**不應**出現該警告
+
+**攔截層健壯性（R-1～R-5）**
+
+- [ ] 一般影片頁正常播放，切換畫質正常（R-4 主要影響面）
+- [ ] 快速連續換片 5 次（列表頁按「下一部」不等它播完就再按），不應出現卡在「載入中」
+- [ ] 快速連點畫質切換 5 次，不應出現卡在「載入中」
+- [x] **R-5 的決定性測試**（2026-08-24 已完成，結論見四之 R-5）：紅字與 `改寫統計.httpdns = 0` 同時成立 → 紅字來自 B 站自己的請求層，非本腳本。若日後要驗 R-5 本身，條件是取得一份 `httpdns > 0` 的紀錄並確認阻擋仍有效（HTTPDNS 退回系統 DNS、播放正常）
+- [ ] `BiliCDN.diag()` 的 HTTPDNS 計數仍在增加（確認阻擋本身沒被這次改動關掉）
+- [ ] `BiliCDN.diag()` 的改寫計數在切換畫質後有增加（確認 R-4 第 2 點是否真的生效）
+
+**升級路徑**
+
+- [ ] 從 v1.3.3 升級後，既有的 GM 設定（CustomCDN、verbose、disabled、黑名單）保留
+- [ ] 已自行加過「自訂 matches」的使用者，升級後功能正常（重複規則無害，可自行移除）
+
+### 不是本腳本造成的 console 訊息（一併記錄，省得下次再追一輪）
+
+- `Uncaught (in promise) undefined`（無論堆疊是 `bili-comments.*.js` 的 `n` / `l` / `s` / `reloadComment`，或 `video.*.js` 的 `loadVideoData` → `inject.js` → `video.*.js:90`）——B 站自己的請求層在請求失敗或被取消時 `reject()` **不帶參數**、又沒有 `.catch()`，就會印出這一行。不影響播放。**已於 2026-08-24 實機定案**（見四之 R-5 的三項證據）。刻意不處理：要讓它消失只能掛一個全域 `unhandledrejection` 監聽去吞掉，那會連帶蓋掉真正該被看見的錯誤——**我們不吞別人的錯誤**。
+- **判別方式（別用堆疊框架判斷）**：我們的 `send()` 覆寫包住每一個 XHR，所以任何經過它的請求都會在 async 堆疊留下 `send @ userscript.html…` 這個框架，**有這個框架不等於是本腳本造成的**。要區分只能看 `BiliCDN.diag()` 的 `改寫統計.httpdns`：長期為 0 就代表 HTTPDNS 阻擋路徑（R-5 修的那條）從未執行，紅字必然來自 B 站自己。
+
+### 本次刻意不做的事
+
+| 項目 | 決定 | 理由 |
+|---|---|---|
+| `player.bilibili.com/*`（外嵌播放器） | 不做 | 無人回報需求；面板掛在 `.bpx-player-ctrl-setting-others`，在小 iframe 內的體驗未經實測 |
+| `live.bilibili.com/*`（直播） | 不做 | 直播串流機制與攔 playurl 改 `base_url` 的核心邏輯不同源，未經實測 |
+| 啟動自檢（用 `GM_info.script.matches` 對照內部頁面型態表） | 延後 | 需先在實機 console 確認 Tampermonkey 是否提供 `matches` 陣列 |
+| 改用 playurl 的 `cid` 判斷換片 | 延後 | 治本解，但會改變重置動作的觸發時序，對賽馬排程與 `bakeoffStartupDefers` 的影響需實測 |
+| CHANGELOG 頁面對照表當防呆機制 | 降級 | v1.3.3 的註解已證明「寫下來提醒自己」擋不住這類問題；保留為查詢用途，不當防線 |
+
+### 巡檢中「看過但不改」的項目
+
+| 項目 | 判斷 |
+|---|---|
+| ESLint 兩則 `require-atomic-updates` 警告（`activeCdnList` / `reorderRunning`） | 誤報。`reorderRunning` 是 try/finally 保護的重入旗標，`activeCdnList` 的重建在該旗標保護範圍內 |
+| 死節點 TTL 校正用 `now + TTL` 而非 `判刑時間 + TTL` | 因為沒有存 `markedAt`。效果是「規則放寬時最多再多關一個 TTL」，方向仍是縮短，可接受 |
+| `pageDiscoveredCdn` 換片時不重置 | upos host 與影片無關，沿用是合理的 |
+| `res.body.tee()` 後合成的 `Response` 會遺失 `url` / `type` / `redirected` | 理論上有影響，但 segment 路徑是否用得到需實機驗證，未動 |
+| `theWindow.fetch` 改成箭頭函式後 `length` / `name` 改變 | 理論風險，無實證，未動 |
+| seek 預熱重複掛監聽、UI 雙 timer、除以零 | 已有 `__biliCdnSeekBound`、`clearInterval` 交接、`Math.max` 下限保護，無問題 |
+
+
 ## v1.3.3
 
 > **為什麼跳過 1.3.2**：`1.3.2` 這個版號先前已經 commit + push 到 GitHub 過一次

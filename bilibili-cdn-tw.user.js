@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili CDN 台灣優化
 // @namespace    BiliCDN_TW
-// @version      1.3.3
+// @version      1.3.4
 // @description  改善台灣網路觀看 Bilibili 影片時的 CDN 連線穩定度，支援自動切換與卡頓監測
 // @author       jiyunshi <chocosensei214@gmail.com>
 // @license      MIT
@@ -9,6 +9,10 @@
 // @run-at       document-start
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/bangumi/play/*
+// @match        https://www.bilibili.com/list/*
+// @match        https://www.bilibili.com/festival/*
+// @match        https://www.bilibili.com/medialist/play/*
+// @match        https://www.bilibili.com/watchlater/*
 // @match        https://www.bilibili.com/blackboard/*
 // @match        https://www.bilibili.com/mooc/*
 // @match        https://www.bilibili.com/cheese/*
@@ -71,7 +75,7 @@ var EnableWorkerIntercept = true
 
 // ── 版本號 ────────────────────────────────────────────────────────────
 // 單一事實來源：優先讀 Tampermonkey 注入的 GM_info（跟著 @version 走，改版不用四處手動同步）。
-const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.3.3'
+const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.3.4'
 const parseVer = (v) => String(v || '0').split('.').map(n => parseInt(n, 10) || 0)
 const verGte = (a, b) => {
     const A = parseVer(a), B = parseVer(b)
@@ -2257,8 +2261,16 @@ const isBiliFragmentUrl = (url) => {
 const interceptNetResponse = (function (theWindow) {
     const interceptors = []
     const interceptNetResponse = (handler) => interceptors.push(handler)
+    // v1.3.4：handler 的例外必須就地吃掉。這個函式是從 responseText / response 的
+    // **getter** 裡呼叫的——一旦讓例外往外傳，播放器讀一次屬性就等於踩到一次
+    // `throw`，playurl 根本解不出來，整支影片直接不能播。任何改寫失敗都應該
+    // 退化成「不改寫」，而不是「讓頁面壞掉」。
     const handleInterceptedResponse = (response, url) =>
-        interceptors.reduce((m, h) => { const r = h(m, url); return r !== undefined ? r : m }, response)
+        interceptors.reduce((m, h) => {
+            let r
+            try { r = h(m, url) } catch (e) { err('攔截器例外，略過此次改寫：', e); return m }
+            return r !== undefined ? r : m
+        }, response)
 
     // playurl 回應的改寫成本不低（JSON.parse → sanitizePlayInfoUrls 走訪整包幾百個字串
     // 欄位 → JSON.stringify；4K 多畫質 + 多 backup 的回應可以到幾百 KB），而
@@ -2317,25 +2329,59 @@ const interceptNetResponse = (function (theWindow) {
             return super.open(method, url, ...rest)
         }
 
+        // v1.3.4：HTTPDNS 阻擋不再補送 error 事件，改成合成一個 503 JSON 回應。
+        //
+        // v1.3.3 曾為了「別讓呼叫端空等自己的逾時」而補送 error → loadend。實機證實
+        // 那是噪音來源：B 站的請求層收到 error 事件就 `reject()`（不帶參數），而那條
+        // promise 沒有 .catch()，於是 console 每次都留下一行
+        // `Uncaught (in promise) undefined`，堆疊還指回我們的 send()。
+        //
+        // 阻擋 HTTPDNS 的目的是讓它退回系統 DNS，不是在使用者的 console 留紅字——
+        // 阻擋機制本身不該成為噪音來源。fetch 那條路（見下方 theWindow.fetch）早就是
+        // 這個結論、合成 503 JSON 回應；XHR 這條當時漏掉了，現在補齊，兩條路一致：
+        // 對呼叫端而言這是一次「伺服器回了 503」的**正常完成**，不是網路錯誤，
+        // 檢查 status 的會走錯誤分支，直接 parse body 的也解得出東西（不會二次拋錯）。
+        //
+        // 完全不呼叫 super.send()，所以不會有任何真實請求、network entry 或 console 輸出；
+        // 也不再呼叫 abort()（在合成的 load 之後補一個 abort 事件只會讓呼叫端更混亂）。
+        _deliverBlockedHttpDns() {
+            const body = '{"code":-1,"message":"blocked by BiliCDN","data":null}'
+            this._blockedBody = body
+            setTimeout(() => {
+                // 旗標在派送事件的同一刻才立起來：在那之前呼叫端讀到的 readyState
+                // 仍是原生的 OPENED(1)，不會出現「還沒收到回應卻已經是 DONE」的矛盾狀態。
+                this._blockedDone = true
+                try {
+                    // 只用 dispatchEvent：onreadystatechange / onload / onloadend 是事件處理器
+                    // IDL 屬性，本來就會被 dispatchEvent 一併呼叫，額外手動呼叫等於觸發兩次。
+                    this.dispatchEvent(new Event('readystatechange'))
+                    const detail = { lengthComputable: true, loaded: body.length, total: body.length }
+                    this.dispatchEvent(new ProgressEvent('load', detail))
+                    this.dispatchEvent(new ProgressEvent('loadend', detail))
+                } catch (e) { err('HTTPDNS 阻擋回應派送失敗：', e) }
+            }, 0)
+        }
+        // 合成回應期間，這些屬性都要自圓其說——呼叫端讀到「readyState 4 + status 503 +
+        // 一份合法 JSON」才會當成正常完成的請求。未被阻擋時一律走原生實作。
+        get readyState()  { return this._blockedDone ? 4 : super.readyState }
+        get status()      { return this._blockedDone ? 503 : super.status }
+        get statusText()  { return this._blockedDone ? 'Service Unavailable' : super.statusText }
+        get responseURL() { return this._blockedDone ? (this._interceptUrl || '') : super.responseURL }
+        getResponseHeader(name) {
+            if (!this._blockedDone) return super.getResponseHeader(name)
+            return String(name).toLowerCase() === 'content-type' ? 'application/json' : null
+        }
+        getAllResponseHeaders() {
+            return this._blockedDone ? 'content-type: application/json\r\n' : super.getAllResponseHeaders()
+        }
+
         send(...args) {
             if (this._biliJsonMetadata && !disabled) {
                 try { this.setRequestHeader('Accept', 'application/json, text/plain, */*') } catch {}
             }
 
             if (this._blockAbort) {
-                const self = this
-                setTimeout(() => {
-                    // v1.3.3：依 XHR 規範，abort() 在「已 open 但未 send」的狀態下
-                    // 不會觸發任何事件 —— 舊寫法等於讓呼叫端拿不到任何回呼，只能靠它
-                    // 自己的逾時才會放棄。這裡補送一組跟真實網路錯誤一致的事件
-                    // （error → loadend），讓 B 站的 HTTPDNS 客戶端立刻知道這條失敗、
-                    // 直接走系統 DNS，不必空等。
-                    try {
-                        self.dispatchEvent(new ProgressEvent('error'))
-                        self.dispatchEvent(new ProgressEvent('loadend'))
-                    } catch {}
-                    try { self.abort() } catch {}
-                }, 0)
+                this._deliverBlockedHttpDns()
                 return
             }
 
@@ -2408,12 +2454,20 @@ const interceptNetResponse = (function (theWindow) {
         }
 
         get responseText() {
+            if (this._blockedDone) return this._blockedBody
             if (this.readyState !== this.DONE) return super.responseText
             if (disabled) return super.responseText
             if (!isPlayUrlApi(this._interceptUrl || this.responseURL)) return super.responseText
             return transformPlayurlOnce(this, 'text', super.responseText)
         }
         get response() {
+            if (this._blockedDone) {
+                // responseType='json' 的呼叫端要拿到已解析的物件，不是字串（同 R-4 第 2 點）。
+                if (this.responseType === 'json') {
+                    try { return JSON.parse(this._blockedBody) } catch { return null }
+                }
+                return this.responseType === '' || this.responseType === 'text' ? this._blockedBody : null
+            }
             if (this.readyState !== this.DONE) return super.response
             if (disabled) return super.response
             if (!isPlayUrlApi(this._interceptUrl || this.responseURL)) return super.response
@@ -2569,15 +2623,36 @@ const interceptNetResponse = (function (theWindow) {
 
         // playurl API 回應攔截
         if (!isPlayUrlApi(urlStr)) return OriginalFetch(input, init)
+        // v1.3.4：這裡原本包了一層 `new Promise(resolve => response.text().then(...))`，
+        // 而那個 executor **沒有 reject 參數**。`response.text()` 只要 reject
+        // （連線在收到 header 之後才斷、或播放器把這次 playurl 請求 abort 掉——
+        // 快速連續換片、連點畫質切換時都會發生），內層的 rejection 就無處可去，
+        // 外層 Promise 既不 resolve 也不 reject —— 呼叫端的 `await fetch(...)`
+        // **永遠不會回來**，播放器停在「載入中」，只能重整。症狀正好是
+        // 「偶爾有幾部影片點進去一直轉圈」。
+        // 直接回傳 .then() 鏈即可：rejection 會照 Promise 語意往外傳，
+        // 播放器的錯誤處理與重試才有機會運作。
         return OriginalFetch(input, init).then(response =>
-            new Promise(resolve =>
-                response.text().then(text =>
-                    resolve(new Response(
-                        handleInterceptedResponse(text, urlStr),
-                        { status: response.status, statusText: response.statusText, headers: response.headers }
-                    ))
-                )
-            )
+            response.text().then(text => {
+                // 改寫失敗絕不能讓整個回應消失：退回原始 text，寧可不優化也要能播。
+                let out = text
+                try {
+                    const r = handleInterceptedResponse(text, urlStr)
+                    if (typeof r === 'string') out = r
+                } catch (e) { err('playurl 改寫失敗，改用原始回應：', e) }
+                // 204 / 205 / 304 依規範不得帶 body，硬塞會讓 Response 建構子丟 TypeError。
+                const nullBody = response.status === 204 || response.status === 205 || response.status === 304
+                try {
+                    return new Response(nullBody ? null : out, {
+                        status: response.status, statusText: response.statusText, headers: response.headers,
+                    })
+                } catch (e) {
+                    // 連合成 Response 都失敗（極少見）時，至少把原始內容以 200 交回去，
+                    // 而不是讓呼叫端拿到一個 rejected promise。
+                    err('合成 playurl Response 失敗，改用最小回應：', e)
+                    return new Response(nullBody ? null : text, { status: response.status || 200 })
+                }
+            })
         )
     }
 
@@ -4894,11 +4969,21 @@ if (typeof GM_registerMenuCommand === 'function') {
     // 攔截 playurl API 回應，改寫 base_url + backup_url
     interceptNetResponse((response, url) => {
         if (disabled || !isPlayUrlApi(url)) return
-        if (response === null) return true
+        // v1.3.4：原本這行是 `if (response === null) return true`。回傳值只要不是
+        // undefined 就會被當成「新的回應內容」沿用下去 —— 也就是把回應換成布林值
+        // `true`，呼叫端讀到的 responseText 會變成 true。改成直接回傳 undefined，
+        // 語意才是「這次不改寫，維持原樣」。
+        if (response === null || response === undefined) return
         try {
-            const playInfo = JSON.parse(response)
+            // XHR 若設了 responseType='json'，super.response 拿到的是**已解析的物件**，
+            // 不是字串。舊寫法一律 JSON.parse(物件) → 被強制轉成 "[object Object]"
+            // → 丟 SyntaxError → 落到下面的 catch → 整包回應原封不動送出去。
+            // 也就是說走這條路徑的 playurl **從來沒有被改寫過**，而且完全無聲無息。
+            const isObj = typeof response === 'object'
+            const playInfo = isObj ? response : JSON.parse(response)
             playInfoTransformer(playInfo)
-            return JSON.stringify(playInfo)
+            // 物件是就地改寫，回傳同一個參考即可；字串才需要重新序列化。
+            return isObj ? playInfo : JSON.stringify(playInfo)
         } catch (e) { err('playurl parse error:', e) }
     })
 
@@ -4914,13 +4999,23 @@ if (typeof GM_registerMenuCommand === 'function') {
 
     const transformInitialPlayInfo = () => {
         if (disabled) return
+        // v1.3.4：兩個呼叫點都要保證「改寫失敗 ≠ 播放資訊消失」。
+        const safeTransform = (v) => {
+            try { playInfoTransformer(v) }
+            catch (e) { err('__playinfo__ 改寫失敗，改用原始資料：', e) }
+        }
         if (unsafeWindow.__playinfo__) {
-            playInfoTransformer(unsafeWindow.__playinfo__)
+            safeTransform(unsafeWindow.__playinfo__)
         } else {
             let internal = unsafeWindow.__playinfo__
             Object.defineProperty(unsafeWindow, '__playinfo__', {
                 get: () => internal,
-                set: v => { playInfoTransformer(v); internal = v },
+                // ★ 賦值一定要發生。舊寫法是 `set: v => { playInfoTransformer(v); internal = v }`，
+                // playInfoTransformer 的前半段（playInfo.result 分支）並不在它自己的
+                // try/catch 範圍內，一旦丟出例外，`internal = v` 這行就不會執行 ——
+                // 頁面明明寫入了 __playinfo__，讀回來卻是 undefined，播放器拿不到
+                // 初始播放資訊，而且例外還會往回炸進 B 站自己的 inline script。
+                set: v => { safeTransform(v); internal = v },
                 configurable: true
             })
         }
@@ -4998,12 +5093,18 @@ if (typeof GM_registerMenuCommand === 'function') {
     }
 
     let pageHooksApplied = false
+    // v1.3.4：這四個 hook 原本是裸呼叫，而 applyPageHooks() 本身在 Main IIFE 的
+    // 頂層被直接執行 —— 任何一個丟出例外，後面三個不會安裝、pageHooksApplied
+    // 停在 false，例外再往上炸掉整個 IIFE，於是 **它後面的所有東西**
+    //（SPA 換片偵測、Watchdog、seek 預熱、設定面板、選單）全部不會執行。
+    // 一個小失誤的爆炸半徑不該是整支腳本。逐項隔離：壞一個只少一個功能。
     const applyPageHooks = () => {
         if (disabled || pageHooksApplied) return
-        transformInitialPlayInfo()
-        blockWebRtc()
-        installVisibilitySpoof()
-        installDashFragmentErrorHook()
+        const step = (name, fn) => { try { fn() } catch (e) { err('page hook 失敗（' + name + '）：', e) } }
+        step('transformInitialPlayInfo', transformInitialPlayInfo)
+        step('blockWebRtc',              blockWebRtc)
+        step('installVisibilitySpoof',   installVisibilitySpoof)
+        step('installDashFragmentErrorHook', installDashFragmentErrorHook)
         pageHooksApplied = true
     }
     applyPageHooks()
@@ -5117,20 +5218,63 @@ if (typeof GM_registerMenuCommand === 'function') {
     // ── SPA 換片偵測 ────────────────────────────────────────────────────
     // B 站換影片不重載頁面（pushState）；換片＝新的 base_url，須清掉舊片殘留：
     // 解除舊強制改寫、重置賽馬冷卻與 Watchdog，讓新影片重新選最佳節點。
+    // v1.3.4：影片識別碼有兩種存放位置，過去只翻了第一種——
+    //   (a) pathname 型（/video/BV…、/bangumi/play/ep…）：編號寫在路徑裡。
+    //   (b) query 型（/list/、/festival/、/medialist/）：pathname 從頭到尾不變
+    //       （例如一路都是 /list/watchlater），換片只改 ?bvid= / ?oid=。
+    // 只翻 pathname 的話，(b) 這類頁面在列表裡連播十部片會回傳同一個 key，
+    // onSpaNavigate 第一行就 return —— 強制改寫不解除、賽馬冷卻不重置、
+    // 碼率與 Watchdog 狀態整包沿用上一部。這跟 v1.3.3 修的「多 P 只改 ?p=」
+    // 是同一種病：判斷式沒跟上新的網址型態，而且失敗時完全沒有跡象。
+    let videoKeyUsedFallback = false   // 上一次 getVideoKey() 是否兩種來源都落空
     const getVideoKey = () => {
+        let sp
+        try { sp = new URLSearchParams(location.search) } catch { sp = new URLSearchParams('') }
+        // (a) pathname 優先：一般影片頁的結果與 v1.3.3 完全一致，行為不變。
         const m = location.pathname.match(/\/(BV[0-9A-Za-z]+|ep\d+|ss\d+|av\d+)/i)
-        const base = m ? m[1].toLowerCase() : location.pathname
+        // (b) pathname 沒有才看 query。oid/aid 是 av 號的數字部分，補上 'av' 前綴，
+        //     讓同一部片不論從哪種頁面進來都收斂到同一個 key。
+        const fromQuery = m ? '' : (sp.get('bvid')
+            || (sp.get('epid') ? 'ep' + sp.get('epid') : '')
+            || (sp.get('oid') ? 'av' + sp.get('oid') : '')
+            || (sp.get('aid') ? 'av' + sp.get('aid') : ''))
+        videoKeyUsedFallback = !m && !fromQuery
+        const base = (m ? m[1] : (fromQuery || location.pathname)).toLowerCase()
         // v1.3.3：多 P 影片切換分集只會改 ?p=，pathname 一個字都不變 —— 不納入的話
         // 換分集不算換片，新分集會整包沿用上一集的碼率、賽馬冷卻與 Watchdog 狀態
         // （長片合集、課程、紀錄片這類多 P 內容最容易中）。
-        let part = ''
-        try { part = new URLSearchParams(location.search).get('p') || '' } catch {}
+        const part = sp.get('p') || ''
         return part ? base + '#p' + part : base
+    }
+    // v1.3.4（改進 D-1）：把「認不出這是哪部片」這件事從靜默失敗改成會出聲。
+    // 過去兩種來源都落空時會安靜退回 location.pathname —— 看起來很合理，實際上
+    // 換片偵測已經整個失效，而且不會留下任何跡象，只能等使用者回報「怪怪的」。
+    // 三個刻意的設計：
+    //   1. 不受 Config.verbose 控制（同 CustomCDN 安全警告的理由）——要靠它主動
+    //      現身，就不能藏在預設關閉的開關後面。
+    //   2. 只在 onSpaNavigate 呼叫，不在 getVideoKey 內呼叫。頁面剛載入時
+    //      /list/watchlater 可能還沒帶上 ?bvid=（B 站隨後才 pushState 補上），
+    //      在 getVideoKey 裡叫會產生誤報。發生過 SPA 導覽卻仍認不出影片，才是真問題。
+    //   3. 用 warn 不用 error，並寫明 CDN 改寫不受影響 —— 這是給回報用的線索，
+    //      不是故障，不需要讓一般使用者緊張。
+    // 這一則涵蓋的是「@match 有涵蓋、但網址型態不認得」的情況；
+    // 「@match 根本沒涵蓋」的新頁型腳本不會被載入，偵測不到，只能靠使用者回報。
+    let videoKeyFallbackWarned = false
+    const warnIfVideoKeyUnresolvable = () => {
+        if (!videoKeyUsedFallback || videoKeyFallbackWarned) return
+        videoKeyFallbackWarned = true
+        console.warn('[' + PluginName + ']: 這個頁面的網址取不到影片識別碼（'
+            + location.pathname + '），SPA 換片偵測可能失效——換下一部影片時不會重新'
+            + '挑選節點。CDN 改寫本身不受影響，影片仍會正常播放。'
+            + '若換片後感覺變卡，請把這個網址型態回報給作者。')
     }
     let currentVideoKey = getVideoKey()
     let spaHooked = false
     const onSpaNavigate = () => {
         const key = getVideoKey()
+        // v1.3.4：一定要放在下面的 early return 之前——「認不出影片」的症狀正是
+        // key 一直不變、每次都從那一行 return 掉，放在後面等於永遠不會執行。
+        warnIfVideoKeyUnresolvable()
         if (key === currentVideoKey) return
         currentVideoKey = key
         forcedRedirectHosts.clear()

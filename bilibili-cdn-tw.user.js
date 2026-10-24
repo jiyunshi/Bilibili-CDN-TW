@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili CDN 台灣優化
 // @namespace    BiliCDN_TW
-// @version      1.3.4
+// @version      1.3.5
 // @description  改善台灣網路觀看 Bilibili 影片時的 CDN 連線穩定度，支援自動切換與卡頓監測
 // @author       jiyunshi <chocosensei214@gmail.com>
 // @license      MIT
@@ -75,7 +75,7 @@ var EnableWorkerIntercept = true
 
 // ── 版本號 ────────────────────────────────────────────────────────────
 // 單一事實來源：優先讀 Tampermonkey 注入的 GM_info（跟著 @version 走，改版不用四處手動同步）。
-const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.3.4'
+const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.3.5'
 const parseVer = (v) => String(v || '0').split('.').map(n => parseInt(n, 10) || 0)
 const verGte = (a, b) => {
     const A = parseVer(a), B = parseVer(b)
@@ -98,12 +98,22 @@ let disabled = !!GM_getValue('disabled')
 // 但至少讓 BiliCDN.diag() 能一眼看出「是選擇器找不到面板，還是真的沒問題」。
 let uiInjectStatus = 'pending'   // 'pending' | 'ok' | 'timeout'
 
-// ── 台灣常見不可用節點 ────────────────────────────────────────────────
-// 這些節點在台灣常見 DNS 失敗或區域拒絕，預設先避開以減少無效連線。
-const INITIAL_DEAD_HOSTS_TW = [
-    'upos-sz-mirrorhwov.bilivideo.com',   // 台灣 DNS 普遍屏蔽
-    'upos-sz-mirrorhw.bilivideo.com',     // 台灣 IP 區域拒絕 (HTTP 959)
-    'upos-hz-mirroraliov.bilivideo.com',  // 杭州內網域名，台灣 DNS 不解析
+// ── 台灣推定不可用節點 ────────────────────────────────────────────────
+// 這些節點在台灣已知不可用，預設先避開以減少無效連線。
+//
+// ★ 它們**不會**出現在「持久死節點」清單（knownDeadHosts）裡，這是刻意的：
+// 這份名單只是一個「推定」（isPresumedBadHost），選路、探測、賽馬、preconnect 一律跳過，
+// diag() 的「推定不可用（presumed）」欄位會列出它們。推定只在「本機從來沒有成功紀錄」時成立，
+// 換電信商 / VPN 後只要真的服務過一次 segment 就自動解除——標進死節點清單就沒有這條路了。
+// （v1.3.2 以前的版本探測會真的打到它們、失敗後標死 30 天，所以舊的診斷紀錄裡看得到它們；
+//   v1.3.3 起改成直接跳過不探測，舊紀錄到期後就不會再出現。v1.3.5 前這個常數叫
+//   INITIAL_DEAD_HOSTS_TW、函式叫 isPresumedDnsFailHost，名稱跟上述行為對不上，改名。）
+//
+// 不可用的原因不只一種（2026-10-25 從台灣以 Resolve-DnsName + curl /crossdomain.xml 實測）：
+const PRESUMED_BAD_HOSTS_TW = [
+    'upos-sz-mirrorhwov.bilivideo.com',   // NXDOMAIN：網域不存在
+    'upos-sz-mirrorhw.bilivideo.com',     // DNS 解析得到、連得上，但回 HTTP 959（區域拒絕）
+    'upos-hz-mirroraliov.bilivideo.com',  // NXDOMAIN：杭州內網域名
 ]
 
 // ── playurl API 前綴 ──────────────────────────────────────────────────
@@ -141,6 +151,15 @@ const isPlayUrlApi = (url) => {
 const PREFERRED_CDN_LIST_RAW = [
     // 海外（ov）：對台灣線路最短，兩次獨立量測都最快
     'upos-sz-mirroraliov.bilivideo.com',
+    // v1.3.5：香港 BCache（Equinix HK，103.151.151.x）。2026-10-25 從台灣以乾淨 fetch + 真實簽名 m4s、
+    // 只量「沒被請求過的位置」實測：換 host 後回 206 且帶 CORS，TCP 22~39ms，
+    // 4 支片（含冷門片）未快取位置 40~101 Mbps —— 是唯一每支片都穩定的節點群
+    // （aliov 34~320、bos 24~29、Akamai 冷門片只有 0.8~1.6）。
+    // 只放實測過的三台；同系列 01-07 是 NXDOMAIN，其餘沒有吞吐量數據就不放。
+    // 列進這份清單即代表「驗證過」，isUnstableCdnHost 會因此不再把它們當成一般 BCache 排除。
+    'cn-hk-eq-01-03.bilivideo.com',
+    'cn-hk-eq-01-05.bilivideo.com',
+    'cn-hk-eq-01-01.bilivideo.com',
     // cosov 留在 RAW 清單但被 ExcludeHostKeywords 預設排除（見上方說明）。
     // 保留在這裡是為了讓想自己實驗的人 BiliCDN.include("cosov") 就能放行，不必改原始碼。
     'upos-sz-mirrorcosov.bilivideo.com',
@@ -151,7 +170,7 @@ const PREFERRED_CDN_LIST_RAW = [
     'upos-sz-mirrorbos.bilivideo.com',
     'upos-tf-all-tx.bilivideo.com',
     'upos-sz-mirrorcos.bilivideo.com',
-    // 以下三個在台灣已知不可用（INITIAL_DEAD_HOSTS_TW），留在清單裡是為了讓
+    // 以下三個在台灣已知不可用（PRESUMED_BAD_HOSTS_TW），留在清單裡是為了讓
     // 「本機實測成功過一次就自動解除推定」這條路仍然成立（換電信商/VPN 可能可用）
     'upos-sz-mirrorhwov.bilivideo.com',
     'upos-sz-mirrorhw.bilivideo.com',
@@ -345,7 +364,7 @@ const countUsableCandidates = (excluding) => PREFERRED_CDN_LIST.filter(c =>
     && !matchesExclude(c)
     && !knownDeadHosts.has(c)
     && !blacklistSet.has(c)
-    && !isPresumedDnsFailHost(c)
+    && !isPresumedBadHost(c)
 ).length
 
 // 黑名單至少要留這麼多個可用節點。低於它就不准再關人。
@@ -460,6 +479,14 @@ let currentStreamBitsPerSec = 0
 // v1.3.3：這支片提供的所有畫質（height + bandwidth），用來把 currentStreamBitsPerSec
 // 校正成「實際正在播的畫質」而不是「清單裡最高的畫質」。見 syncStreamBitrateFromVideo。
 let streamProfile = null
+// v1.3.5：切到更高畫質時待補的一輪賽馬（值為新碼率，0 = 沒有待辦）。
+// 由 syncStreamBitrateFromVideo 登記、maybeRunQualityUpBakeoff 消化，見後者說明。
+let qualityUpPendingBps = 0
+// 上一次從 <video> 實際校正出來的碼率。基準不能用 currentStreamBitsPerSec：playurl 每到一次就會
+// 把它蓋成「清單最高畫質」的估計值，若切畫質時播放器剛好重打 playurl，就會拿新清單的最高值
+// 跟新畫質比，永遠看不出往上跳。
+let lastSyncedStreamBps = 0
+const qualityUpBakeoffDone = new Set()   // 這支片已經因「切到這個碼率」測過的，避免來回切畫質重複測
 let cdnHealthSaveTimer = null
 // 全域記錄最近一次觀察到的 video 倍速；PerformanceObserver entry 收到時
 // 沒有 video 參考，靠 Watchdog.tick 同步更新此值。
@@ -562,8 +589,8 @@ const ensureCdnHealth = (cdn) => {
 // 反而比有幾次成功紀錄的節點更容易在起播那一刻被選中。
 // 一旦有了真實資料（successes/samples > 0）就完全不干預，
 // 使用者自己的實測永遠優先於這份清單。
-if (INITIAL_DEAD_HOSTS_TW.length) {
-    INITIAL_DEAD_HOSTS_TW.forEach(h => {
+if (PRESUMED_BAD_HOSTS_TW.length) {
+    PRESUMED_BAD_HOSTS_TW.forEach(h => {
         const existing = cdnHealth[h]
         if (existing && ((existing.successes || 0) > 0 || (existing.samples || 0) > 0)) return
         const c = ensureCdnHealth(h)
@@ -571,17 +598,17 @@ if (INITIAL_DEAD_HOSTS_TW.length) {
     })
 }
 
-// ── 已知在台灣不解析的節點：省掉「再確認一次」的那個請求 ──────────────
+// ── 推定在台灣不可用的節點：省掉「再確認一次」的那個請求 ──────────────
 // 探測失敗時預設會再呼叫一次 confirmHostReachable() 確認，避免一次瞬間拖動就把
-// 好節點標死 7~30 天。但對 INITIAL_DEAD_HOSTS_TW 這幾個「已知在台灣就是不解析」、
+// 好節點標死 7~30 天。但對 PRESUMED_BAD_HOSTS_TW 這幾個「已知在台灣不可用」、
 // 而且本機從來沒有任何成功紀錄的 host，那次確認換不到新資訊（答案幾乎確定是
 // DNS 失敗），只會在 console 多印一行紅字 —— 使用者回報過的 `?_c=...` 那行就是它。
 //
 // 「本機從來沒有成功紀錄」這個條件很重要 —— 它保留了 v1.3.0 的設計意圖：不同電信商 /
 // VPN 路由差異很大，只要這個 host 在**你的**網路上真的成功過一次，就不再套用這條捷徑，
 // 一律走完整的確認流程。
-const KNOWN_BAD_TW_HOSTS = new Set(INITIAL_DEAD_HOSTS_TW)
-const isPresumedDnsFailHost = (host) => {
+const KNOWN_BAD_TW_HOSTS = new Set(PRESUMED_BAD_HOSTS_TW)
+const isPresumedBadHost = (host) => {
     if (!host || !KNOWN_BAD_TW_HOSTS.has(host)) return false
     const h = cdnHealth[host]
     return !h || ((h.successes || 0) === 0 && (h.samples || 0) === 0)
@@ -671,6 +698,8 @@ const recordCdnThroughput = (cdn, bytes, durationMs, playbackRate) => {
         scheduleCdnHealthSave()
         return
     }
+    // v1.3.5：Akamai 不在賽馬候選裡，走到這裡的 Akamai 樣本一定是播放器真實下載的 segment
+    noteAkamaiSegmentSpeed(cdn, bytes, mbps)
     // 均值之外同步追蹤「抖動」：緩衝夠不夠是看均速，卡不卡頓看的是穩不穩——同樣均速
     // 15~35 Mbps 抖動的節點，比穩定在 20 Mbps 的節點更容易讓緩衝瞬間見底。用標準的
     // EWMA 變異數遞增公式（跟均值同一個 alpha，兩者衰減步調一致），第一個樣本沒有
@@ -736,6 +765,12 @@ const JITTER_WEIGHT      = 0.4
 const JITTER_PENALTY_CAP = 0.35
 const JITTER_PRIOR_CV     = 0.25  // 低樣本節點的悲觀先驗抖動假設
 const JITTER_PRIOR_WEIGHT = 2     // 先驗的「等效樣本數」，樣本數遠大於這個值後才主要信任實測
+// v1.3.5：超過 2 倍需求的「餘裕加分」，到 REWARD_SATURATION_RATIO 倍拿滿 HEADROOM_BONUS_MAX（見 getCdnHealthScore）
+const REWARD_SATURATION_RATIO = 10
+const HEADROOM_BONUS_MAX      = 0.3
+// v1.3.5：延遲懲罰 = min(上限, latencyMs / 尺度)。400ms 就到上限，9ms 幾乎不扣。
+const LATENCY_PENALTY_CAP      = 0.25
+const LATENCY_PENALTY_SCALE_MS = 1600
 
 // 有效樣本數：跟 reward 用同一個半衰因子折舊。Discounted-UCB 的標準實作要點是分子
 // （累積 reward）和分母（樣本數）必須同步打折——只折分子的話，久沒用的好節點雖然
@@ -772,14 +807,26 @@ const getCdnHealthScore = (cdn, opts) => {
     const h = cdnHealth[cdn]
     const required = getRequiredStreamMbps(undefined, 'steady')
 
-    // ── reward：正規化到 0~1（達到 2 倍需求速度即視為滿分，避免高速節點之間的絕對差距
-    // 把分數尺度撐爆，導致 explore 項在快節點之間完全失去作用）
+    // ── reward：兩段式。
+    //   (1) 2 倍需求以內：跟 v1.3.4 完全相同的線性 0~1。這一段是當初用模擬器網格搜尋驗證過的，
+    //       而且 4K 這類「節點普遍跑不到 2 倍」的情境排序完全靠它分出快慢，不能動。
+    //   (2) 超過 2 倍：額外的「餘裕加分」，對需求倍數取對數，到 REWARD_SATURATION_RATIO 倍拿滿 HEADROOM_BONUS_MAX。
+    // v1.3.5 以前只有 (1)，2 倍就滿分：1080P 需求約 1.8 Mbps → 3.6 Mbps 就滿分，於是 3.5 Mbps 的 cos
+    // 跟 33 Mbps 的 aliov 同分，排序改由探索加成與雜訊決定（2026-10-25 實機：賽馬後「目前最佳」=
+    // 只量到 3.5 Mbps、剛被救回而探索加成最多的 cos）。「夠用」之上的餘裕不是浪費：快取沒命中要回源、
+    // 跨境線路抖動、拖時間軸要一口氣補滿緩衝，都在吃這段餘裕。
+    // 曾試過整條改成對數（2 倍 ≈ 0.46、10 倍 = 1）：1080P 卡頓 22.5→5.3 秒，但 4K 從 844 惡化到 1266 秒——
+    // 對數把 2 倍以內的差距壓扁了（aliov 與 cos 從差 0.55 分變成差 0.23 分），探索加成就更容易把播放拉去試慢節點。
     let throughput = (h && h.samples) ? h.ewmaMbps : 0
     if (h && h.samples && h.lastSeen) {
         const age = Date.now() - h.lastSeen
         if (age > 0) throughput *= Math.pow(0.5, age / THROUGHPUT_HALFLIFE_MS)
     }
-    const reward = Math.min(1, throughput / Math.max(1, required * 2))
+    const ratio    = throughput / Math.max(1, required)
+    const headroom = ratio > 2
+        ? HEADROOM_BONUS_MAX * Math.min(1, Math.log2(ratio / 2) / Math.log2(REWARD_SATURATION_RATIO / 2))
+        : 0
+    const reward = Math.min(1, ratio / 2) + headroom
 
     // ── explore：標準 UCB1，用折舊後的有效樣本數，讓久沒用的節點自然回到探索池
     // exploit 模式（起播）直接歸零：見上方 getCdnHealthScore 的完整說明。
@@ -789,11 +836,14 @@ const getCdnHealthScore = (cdn, opts) => {
         ? 0
         : UCB_EXPLORE_C * Math.sqrt(Math.log(total + 1) / (nEff + 1))
 
-    // ── penalty：同樣換算到 0~1 級距，延遲探測（探測 RTT，資訊量低）權重壓到最多 10%
+    // ── penalty：同樣換算到 0~1 級距。延遲權重最多 LATENCY_PENALTY_CAP（見下方 latencyPenalty 說明）
     const failPenalty    = Math.min(0.6, ((cdnFailCount[cdn] || 0) * 0.15) + (h ? h.failures * 0.10 : 0))
     const slowPenalty    = Math.min(0.4, h ? h.slowSamples * 0.10 : 0)
     const softPenalty    = isCdnSoftBlocked(cdn) ? 1.5 : 0   // 大於 1：一定排到最後
-    const latencyPenalty = h && h.latencyMs ? Math.min(0.10, h.latencyMs / 3000) : 0
+    // v1.3.5：上限 0.10 → LATENCY_PENALTY_CAP。首位元組時間就是起播與每次拖時間軸要乾等的時間，
+    // 實測 aliov 9ms vs bos 400ms，舊權重下兩者只差 0.10 分、還不到 CDN_STICKY_MARGIN，等於看不見。
+    // 仍然要有上限：latencyMs 混了冷 TLS 握手（實測上界 8.8 秒），單筆冷樣本不能直接毀掉一個好節點。
+    const latencyPenalty = h && h.latencyMs ? Math.min(LATENCY_PENALTY_CAP, h.latencyMs / LATENCY_PENALTY_SCALE_MS) : 0
     // ── 抖動懲罰：緩衝夠不夠看均速，卡不卡頓看的是穩不穩定。同樣均速 20Mbps，
     // 15~35 抖動的節點比穩定 18~22 的節點更容易讓緩衝瞬間見底、觸發卡頓。用變異係數
     // （標準差/均值，無因次，不受節點快慢的絕對量綱影響）換算成跟其他懲罰同級距的分數。
@@ -843,7 +893,7 @@ const CDN_STICKY_MARGIN = 0.20
 
 const getHealthyCdnList = (opts) => {
     // ★ 過濾的**順序**是關鍵，不能只看每一層各自的邏輯。
-    // isPresumedDnsFailHost 是「已知連不到」（必定失敗），cdnFailCount 是「最近表現不好」
+    // isPresumedBadHost 是「已知連不到」（必定失敗），cdnFailCount 是「最近表現不好」
     // （只是慢）。必須先整批拿掉前者，再談失敗次數——反過來寫的話，當所有可達節點都因為
     // 失敗次數超標被濾掉時，剩下的就只有那些「從沒被用過、所以也從沒失敗過」的不可達節點，
     // 選路會直接把 segment 導去 NXDOMAIN。使用者實測 log 出現過：
@@ -851,12 +901,12 @@ const getHealthyCdnList = (opts) => {
     // 「被懲罰過但連得到」永遠優於「乾淨但連不到」。
     const mk = (cdn, index) => ({ cdn, index, health: cdnHealth[cdn], score: getCdnHealthScore(cdn, opts) })
     const all = activeCdnList.map(mk)
-    const reachable  = all.filter(item => !isPresumedDnsFailHost(item.cdn))
+    const reachable  = all.filter(item => !isPresumedBadHost(item.cdn))
     // ★ 上面那條「可達優先於乾淨」的規則有個更上游的漏洞：cdnFailCount 只是「記帳」，
     // 但累積到 CDN_FAIL_THRESHOLD（2 次）就會 addToBlacklist()，而黑名單是直接把節點
     // **從 activeCdnList 移除**的。也就是說一次網路斷線（Wi-Fi 掉線、VPN 重連、切換網路）
     // 就能讓每個正在用的節點各記 2 次失敗，把所有可達節點一次清出候選池——池子裡就只剩
-    // 那幾個「從沒被用過、所以也從沒失敗過」的已知不解析節點。接著 base 退回 all，
+    // 那幾個「從沒被用過、所以也從沒失敗過」的推定不可用節點。接著 base 退回 all，
     // 選路開始把每一顆 segment 都改寫到 NXDOMAIN，而黑名單一綁就是 24 小時：
     // 使用者看到的是「整天都完全播不出來 + console 滿滿 ERR_NAME_NOT_RESOLVED」。
     // 排序層修好了，但成員層還會被掏空——所以退路也要補在成員層。
@@ -865,7 +915,7 @@ const getHealthyCdnList = (opts) => {
     let base = reachable
     if (!base.length) {
         const salvaged = PREFERRED_CDN_LIST
-            .filter(c => !isPresumedDnsFailHost(c) && !knownDeadHosts.has(c) && !matchesExclude(c))
+            .filter(c => !isPresumedBadHost(c) && !knownDeadHosts.has(c) && !matchesExclude(c))
             .map(mk)
         base = salvaged.length ? salvaged : all
     }
@@ -1137,6 +1187,11 @@ const noteDiscoveredCdn = (host) => {
 // MCDN / PCDN / 區域自建節點（常見海外卡頓來源）
 const isUnstableCdnHost = (host) => {
     if (!host) return false
+    // v1.3.5：白名單優先。PREFERRED_CDN_LIST 裡的 host 都是逐台驗證過的，即使名稱長得像 BCache
+    // （香港的 cn-hk-eq-01-0X）也不算不穩定。集中在這裡判斷，所有呼叫端（吞吐量記錄、
+    // 改寫來源、Transport 改寫、Watchdog 挑元兇……共 11 處）就會一致；被使用者用
+    // ExcludeHostKeywords 排除的 host 不在 PREFERRED_CDN_LIST 裡，自動回到一般 BCache 的處理。
+    if (PREFERRED_CDN_LIST.includes(host)) return false
     if (/\.mcdn\.bilivideo\.(cn|com)$/i.test(host)) return true
     if (/\.szbdyd\.com$/i.test(host)) return true
     // BCache（B 站自建機房）：地區代碼長度不固定，實際看過 cn-tj-cu-01（2 碼）、
@@ -1320,6 +1375,7 @@ const getBufferTargetBytes = (playbackRate) => {
 //
 // 修法：用 <video>.videoHeight 反查對應的 representation 碼率。videoHeight 是播放器
 // 實際解出來的畫面高度，切畫質、ABR 自動降級都會即時反映，比任何清單推測都準。
+const QUALITY_UP_RATIO = 1.4   // 720p→1080p、1080p→1080p+、1080p→4K 都在 1.5 倍以上；同畫質換 codec 通常不到
 const syncStreamBitrateFromVideo = (videoEl) => {
     if (!streamProfile || !streamProfile.reps.length || !videoEl) return
     const h = videoEl.videoHeight || 0
@@ -1338,6 +1394,16 @@ const syncStreamBitrateFromVideo = (videoEl) => {
     if (!bestBps) return
 
     const total = bestBps + (streamProfile.audioBps || 0)
+    // 碼率明顯往上跳（手動切高畫質、或 ABR 自動升級）：先前「現用節點夠快」的判斷是
+    // 用舊碼率算的，可能已經不成立，登記一輪重新測速。往下切不用：需求變低，舊判斷仍然成立。
+    // prev 為 0 代表剛換片還沒有基準，那是起播賽馬的工作，不在這裡重複觸發。
+    // 必須放在下面 5% 的提早 return 之前：playurl 重打時 currentStreamBitsPerSec 已被蓋成新清單
+    // 最高值，實際也正好播那個畫質時會在那裡直接 return，偵測就永遠走不到。
+    const prev = lastSyncedStreamBps
+    lastSyncedStreamBps = total
+    if (prev > 0 && total >= prev * QUALITY_UP_RATIO && !qualityUpBakeoffDone.has(total)) {
+        qualityUpPendingBps = total
+    }
     // 變動小於 5% 就不動，避免每秒重算緩衝目標造成 reached 狀態抖動
     if (currentStreamBitsPerSec > 0 && Math.abs(total - currentStreamBitsPerSec) < currentStreamBitsPerSec * 0.05) return
     setBufferTargetFromBitrate(total, total > 12e6)
@@ -1349,6 +1415,10 @@ const resetStreamProfile = () => {
     // 綁定節點是「這支影片這次簽發」的性質，換片就要重新給機會，不能一路沿用
     hostLockedStreams.clear()
     streamProfile = null
+    qualityUpPendingBps = 0
+    qualityUpBakeoffDone.clear()
+    akamaiSlowStrikes.clear()   // 冷門與否是「這支片」的性質，換片重新判斷
+    lastSyncedStreamBps = 0
     currentStreamBitsPerSec = 0
     baseBufferTargetBytes = DEFAULT_BUFFER_TARGET_BYTES
     seekGraceUntil = 0
@@ -2159,6 +2229,30 @@ const normalizeDashCodecPreference = (dash) => {
     if (normalized.length) dash.video = normalized
 }
 
+// v1.3.5：挑賽馬樣本。賽馬是「把樣本換成各候選 host 去量」，所以樣本只要是一條
+// 能改 host 的 bilivideo 簽名網址即可，不必是播放器的主線路。
+// 舊版只看 dash.video[0].base_url，而台灣拿到的 playurl 在 1080P+ 以下主線路多半是 Akamai
+// （transformStreamItem 一般碼率保留 Akamai 為主）→ 樣本永遠是空的，起播賽馬、切畫質重測
+// 全部不會跑（2026-10-25 實機：兩支片 BiliCDN.bakeoff() 都回「尚無 segment 樣本」）。
+// 這時 backup_url 裡就是 buildBackupUrls 產生的白名單 bilivideo 網址，拿來當樣本即可。
+// 必須在 transformList 之後呼叫：要用的是改寫後的結果，不是 B 站原始給的（可能是 PCDN）。
+const pickBakeoffSampleUrl = (videoList) => {
+    if (!Array.isArray(videoList)) return null
+    for (const item of videoList) {
+        if (!item) continue
+        const urls = [item.base_url, item.baseUrl]
+            .concat(Array.isArray(item.backup_url) ? item.backup_url : [])
+            .concat(Array.isArray(item.backupUrl) ? item.backupUrl : [])
+        // 不能拿來改 host 的一律不要：PCDN 特化路徑、MCDN/BCache 這類不穩定 host、
+        // 以及已知綁定節點的串流（換 host 必定 403，量了也是白量）。
+        const hit = urls.find(u => typeof u === 'string' && isBiliVideoUrl(u)
+            && !isPcdnResourceUrl(u) && !isHostLockedStream(u)
+            && !isUnstableCdnHost(getBiliVideoCdn(u)))
+        if (hit) return hit
+    }
+    return null
+}
+
 // 處理整個 playInfo（dash / durl / durls 三種格式）
 const playInfoTransformer = (playInfo) => {
     if (!playInfo) return
@@ -2226,10 +2320,19 @@ const playInfoTransformer = (playInfo) => {
             transformList(extras,     true)
             sanitizePlayInfoUrls(dash)
 
-            // 拿一條真實視訊 segment 當賽馬樣本（純 bilivideo 來源時才跑；Akamai 為主不適用）
+            // 拿一條真實視訊 segment 當賽馬樣本（見 pickBakeoffSampleUrl：Akamai 為主時改從 backup 取）
             try {
-                const sample = dash.video && dash.video[0] && (dash.video[0].base_url || dash.video[0].baseUrl)
-                if (sample && isBiliVideoUrl(sample) && !isAkamaiUrl(sample)) scheduleBakeoff(sample)
+                const sample = pickBakeoffSampleUrl(dash.video)
+                if (sample) {
+                    // v1.3.5：給賽馬探測一個檔案大小的估計值（碼率 × 長度），讓它能量中後段（見 pickProbeOffset）。
+                    // 樣本可能來自任一個 item 的 base 或 backup，用 pathname 找回它所屬的那個 item。
+                    const key = streamPathKey(sample)
+                    const owner = (dash.video || []).find(it => it && [it.base_url, it.baseUrl]
+                        .concat(it.backup_url || [], it.backupUrl || []).some(u => typeof u === 'string' && streamPathKey(u) === key))
+                    const durSec = +dash.duration || ((+video_info.timelength || 0) / 1000)
+                    if (owner && owner.bandwidth > 0 && durSec > 0) noteStreamSizeEstimate(sample, owner.bandwidth / 8 * durSec)
+                    scheduleBakeoff(sample)
+                }
             } catch {}
 
         } else if (video_info && video_info.durl) {
@@ -2759,6 +2862,48 @@ const isForcedRedirect = (host) => {
     if (t <= Date.now()) { forcedRedirectHosts.delete(host); return false }
     return true
 }
+// v1.3.5：Akamai 冷門片提早切走。
+// 一般畫質（非 4K）時 transformStreamItem 保留 Akamai 當主線路，而 Akamai 的表現取決於「這段有沒有在它的
+// 快取裡」。2026-10-25 實機（乾淨 fetch、真實簽名 m4s、只量沒被請求過的位置）：
+//   熱門片 46~95 Mbps；冷門片（日新說）0.8~1.6 Mbps，並行 4 條連線也只有 1.7 Mbps（瓶頸是 Akamai 回源，不是我們這端）。
+// 1080P+ 需求約 3 Mbps，1 Mbps 的線路只能一路吃緩衝，要等到 Watchdog 判定卡頓才換 —— 使用者已經看到轉圈圈了。
+// 這裡在緩衝見底之前就換：連續 AKAMAI_SLOW_STRIKES 個「夠大」的 Akamai segment 都低於需求速度，
+// **而且**目前最佳的 bilivideo 節點有實測證據跑得到需求的 AKAMAI_ESCAPE_TARGET_MARGIN 倍，才把 Akamai 強制改寫走。
+// 後一個條件排除「使用者自己的網路整體變慢」：那時換節點也沒用，只會多一次連線重建。
+// 這不是拿兩個數字比大小（被動樣本 vs 主動探測不是同一種量法，見賽馬的中途切換說明），
+// 而是兩個各自對「需求」的絕對判斷：Akamai 跟不上、另一顆跟得上。
+// 改寫路徑本身（bilivideo host + Akamai URL）同日實測回 206；10 分鐘（FORCED_REDIRECT_TTL）後自然回到 Akamai 再試。
+const AKAMAI_SLOW_STRIKES         = 2
+const AKAMAI_SLOW_MIN_BYTES       = 256 * 1024
+const AKAMAI_ESCAPE_TARGET_MARGIN = 1.5
+const akamaiSlowStrikes = new Map()   // akamai host -> 連續慢 segment 數（換片時清空）
+const noteAkamaiSegmentSpeed = (host, bytes, mbps) => {
+    if (!host || !host.endsWith('.akamaized.net') || disabled) return
+    if (bytes < AKAMAI_SLOW_MIN_BYTES || !(mbps > 0)) return
+    if (isForcedRedirect(host)) return   // 已經在改寫中
+    const required = getRequiredStreamMbps(undefined, 'steady')
+    if (mbps >= required) { akamaiSlowStrikes.delete(host); return }
+    const strikes = (akamaiSlowStrikes.get(host) || 0) + 1
+    akamaiSlowStrikes.set(host, strikes)
+    if (strikes < AKAMAI_SLOW_STRIKES) return
+    const target = getCurrentCdn()
+    const th = target && cdnHealth[target]
+    if (!target || target.endsWith('.akamaized.net') || !th || !th.samples
+        || th.ewmaMbps < required * AKAMAI_ESCAPE_TARGET_MARGIN) {
+        log('[Akamai] 連續 ' + strikes + ' 個 segment 低於需求（' + mbps.toFixed(1) + ' < ' + required.toFixed(1)
+            + ' Mbps），但沒有證據顯示其他節點跟得上，維持 Akamai')
+        return
+    }
+    akamaiSlowStrikes.delete(host)
+    addForcedRedirect(host)
+    try { Watchdog.noteCdnSwitched() } catch {}
+    promoteBestCdnNow()
+    preconnectBatch([target], true)
+    syncWorkerCdnTarget()
+    log('[Akamai] 冷門片：連續 ' + strikes + ' 個 segment 低於需求（' + mbps.toFixed(1) + ' < ' + required.toFixed(1)
+        + ' Mbps），改寫到 ' + target.split('.')[0] + '（' + th.ewmaMbps.toFixed(1) + ' Mbps），10 分鐘後再試 Akamai')
+}
+
 const getWorkerForceList = () => {
     const out = new Set([...forcedRedirectHosts.keys()].filter(isForcedRedirect))
     PREFERRED_CDN_LIST.forEach(h => {
@@ -2823,10 +2968,13 @@ const biliCdnAbs = (url) => {
     try { return new URL(String(url), BILICDN_BASE).href; } catch { return String(url); }
 };
 const biliCdnMatchesExclude = (host) => BILICDN_EXCLUDES.some((kw) => kw && host.indexOf(kw) !== -1);
+// 必須跟主執行緒的 isUnstableCdnHost 同一套規則（v1.3.5 對齊）：白名單優先（香港 BCache），
+// BCache 地區碼 2~8 碼（舊的 [a-z]{2} 會漏判 cn-hbwh-cm 這類四碼地區，主執行緒在 v1.3.3 就修了，這裡一直沒跟上）。
 const biliCdnIsUnstable = (host) =>
-    !!host && (/\\.mcdn\\.bilivideo\\.(cn|com)$/i.test(host)
+    !!host && BILICDN_PREFERRED.indexOf(host) === -1
+        && (/\\.mcdn\\.bilivideo\\.(cn|com)$/i.test(host)
         || /\\.szbdyd\\.com$/i.test(host)
-        || (/^cn-[a-z]{2}-/.test(host) && host.endsWith('.bilivideo.com')));
+        || (/^cn-[a-z]{2,8}-/i.test(host) && host.endsWith('.bilivideo.com')));
 self.addEventListener('message', (event) => {
     const data = event && event.data;
     if (data && data.__biliCdnSetTarget && typeof data.__biliCdnSetTarget === 'string') {
@@ -3184,6 +3332,88 @@ const confirmHostReachable = (cdn, timeoutMs) => new Promise((resolve) => {
       .catch(() => { clearTimeout(to); done(false) })
 })
 
+// v1.3.5：「這個 host 連不到」要有對照組才算數。
+// confirmHostReachable 只能回答「這次請求有沒有回應」，回答不了「是它壞了，還是我斷網了」。
+// 筆電休眠喚醒、Wi-Fi 切換、VPN 重連的那幾秒，所有請求都是 0 位元組的連線層失敗，
+// 確認請求也一樣失敗 → 當下在用的每一顆節點都被標死 30 天。
+// 2026-10-25 實機：死節點清單裡 aliov / alib / akam / cos 剩餘刑期全是 15.1 天（同一個 2.4 小時窗內
+// 一起被判），而當天用 curl 確認五顆全部 DNS 正常、/crossdomain.xml 回 200 —— 典型的整批誤殺。
+//
+// 回傳 'reachable' | 'dead' | 'network-down'。只有「目標不通、對照組通」才是 'dead'。
+// 對照組優先挑另一顆健康的 CDN（同一條跨境路徑，最能代表「CDN 那一側通不通」），
+// 一顆都沒有時退回頁面本身的網域（我們就在這個頁面上，它不通就是本機網路的問題）。
+// 額外成本只發生在「目標確認失敗」這種少見情況，平常一個請求都不多發。
+const pickControlHost = (exclude) =>
+    [...activeCdnList, ...PREFERRED_CDN_LIST].find(h => h && h !== exclude
+        && !knownDeadHosts.has(h) && !blacklistSet.has(h) && !KNOWN_BAD_TW_HOSTS.has(h)
+        && !isCdnSoftBlocked(h) && !matchesExclude(h))
+    || (typeof location !== 'undefined' && location.hostname) || null
+const confirmHostDead = async (cdn) => {
+    try { if (navigator.onLine === false) return 'network-down' } catch {}
+    if (await confirmHostReachable(cdn, CONFIRM_TIMEOUT_MS)) return 'reachable'
+    const control = pickControlHost(cdn)
+    if (!control) return 'dead'   // 沒有任何對照可用：維持舊行為
+    return (await confirmHostReachable(control, CONFIRM_TIMEOUT_MS)) ? 'dead' : 'network-down'
+}
+
+// v1.3.5：已經被誤殺的節點要能自己回來。修好 confirmHostDead 只能防止「以後」再誤殺，
+// 既有的死節點紀錄會照舊服完 30 天刑期 —— 而被標死的 bilivideo 節點會被 needsRedirect
+// 一律改寫掉，永遠不會再有真實 segment 打到它，也就永遠沒有機會證明自己是好的。
+// 所以定期用跟判死時同一套證據（連不連得到 + 對照組）重新確認一次，連得到就救回。
+//
+// 只複查「判死理由是連不到」的那幾類（DNS / DNS-segment / timeout）：
+//   - HARD-fail 是伺服器明確回了 403/959 之類的拒絕，「連得到」推翻不了它。
+//   - KNOWN_BAD_TW_HOSTS（推定不可用）：hwov / hz-aliov 是 NXDOMAIN，複查只會每 6 小時多印一行紅字；
+//     hw 則是「連得到但回 959」，no-cors 的 opaque 回應讀不到狀態碼，「連得到」會被誤當成「能用」。
+// 頻率限制放在 GM storage（跨分頁共用，理由同 BAKEOFF_TS_KEY）：開 N 個分頁也只有一個分頁會做。
+// 每顆節點最多 2 個 /crossdomain.xml 請求（目標 + 對照組），對照組只在目標不通時才發。
+const DEAD_REVERIFY_TS_KEY   = 'deadReverifyAt_v1'
+const DEAD_REVERIFY_INTERVAL = 6 * 60 * 60 * 1000
+const DEAD_REVERIFY_DELAY_MS = 60 * 1000   // 等起播、首輪探測與賽馬都過去再做，不跟它們搶頻寬
+const DEAD_REVERIFY_MAX_DEFERS = 5
+let deadReverifyRunning = false
+const isReverifiableDead = (e) => !!e && !KNOWN_BAD_TW_HOSTS.has(e.host)
+    && (isDnsReason(e.reason) || isTimeoutReason(e.reason))
+const reverifyDeadHosts = async () => {
+    if (disabled || deadReverifyRunning) return []
+    let last = 0
+    try { last = +GM_getValue(DEAD_REVERIFY_TS_KEY, 0) || 0 } catch {}
+    if (Date.now() - last < DEAD_REVERIFY_INTERVAL) return []
+    const targets = listDeadHosts().filter(isReverifiableDead).map(e => e.host)
+    if (!targets.length) return []
+    // 先寫再做：跟賽馬同一個理由，其他分頁在這一輪還沒做完時就會被擋下。
+    try { GM_setValue(DEAD_REVERIFY_TS_KEY, Date.now()) } catch {}
+    deadReverifyRunning = true
+    const revived = []
+    try {
+        // 序列執行：一次只開一條確認連線，不跟正在播的影片搶頻寬。
+        for (const host of targets) {
+            if (disabled) break
+            const verdict = await confirmHostDead(host)
+            // 本機網路不通時後面的結果全都不可信，這一輪直接放棄（時間戳已寫，6 小時後再來）。
+            if (verdict === 'network-down') break
+            if (verdict === 'reachable' && reviveDeadHost(host)) revived.push(host)
+        }
+    } finally {
+        deadReverifyRunning = false
+    }
+    if (revived.length) {
+        log('[死節點] 複查後確認連得到，已救回：' + revived.map(h => h.split('.')[0]).join('、'))
+    }
+    return revived
+}
+const scheduleDeadHostReverify = (attempt = 0) => {
+    setTimeout(() => {
+        // 時機守衛：拖時間軸或起播緩衝還沒建立時先讓路。延後執行的工作可能剛好落在這兩個時刻，
+        // 跟 seek 要重抓的 segment、起播的第一批 segment 搶頻寬。
+        if (inSeekGrace() || isStartupBuffering()) {
+            if (attempt < DEAD_REVERIFY_MAX_DEFERS) scheduleDeadHostReverify(attempt + 1)
+            return
+        }
+        reverifyDeadHosts().catch(() => {})
+    }, attempt ? 30 * 1000 : DEAD_REVERIFY_DELAY_MS)
+}
+
 // ── segment 連線層失敗處理（v1.3.3）──────────────────────────────────
 // XHR 的 error 事件與 fetch 的 reject 都拿不到瀏覽器的真實原因——ERR_NAME_NOT_RESOLVED
 // 這類訊息只會印在 console，程式讀不到，status 一律是 0。唯一能用的線索是
@@ -3206,19 +3436,24 @@ const handleSegmentConnError = (cdn, bytesReceived) => {
     const last = segConnCheckAt.get(cdn) || 0
     if (now - last < SEG_CONN_CHECK_COOLDOWN) return
     segConnCheckAt.set(cdn, now)
-    // 同上：已知不解析的 host 不必再確認一次。
-    if (isPresumedDnsFailHost(cdn)) {
+    // 同上：推定不可用的 host 不必再確認一次。
+    if (isPresumedBadHost(cdn)) {
         markHostDead(cdn, 'DNS-segment')
-        log('[死節點] 已知在台灣不解析的節點又被指派到 segment，直接標死：' + cdn.split('.')[0])
+        log('[死節點] 推定在台灣不可用的節點又被指派到 segment，直接標死：' + cdn.split('.')[0])
         promoteBestCdnNow()
         return
     }
     // 2026-08-19：確認窗從 2 秒拉到 CONFIRM_TIMEOUT_MS。冷 TLS 握手實測上界 8.8 秒，
     // 2 秒的窗會把「還在握手」的好節點判成「連不到」然後標死 30 天。見 PROBE_TIMEOUT_STRIKES。
-    confirmHostReachable(cdn, CONFIRM_TIMEOUT_MS).then((reachable) => {
+    confirmHostDead(cdn).then((verdict) => {
         // 連得到 → 只是這一次請求出事（伺服器主動斷線之類），recordCdnFailure 已經記過帳，
         // 不需要也不應該升級成標死。
-        if (reachable) return
+        if (verdict === 'reachable') return
+        // v1.3.5：對照組也不通 = 本機斷網，不是這顆節點的錯（見 confirmHostDead）。
+        if (verdict === 'network-down') {
+            log('[死節點] segment 連線失敗，但對照組也連不到，判定為本機網路中斷，不標死：' + cdn.split('.')[0])
+            return
+        }
         markHostDead(cdn, 'DNS-segment')
         log('[死節點] segment 連線層失敗且確認連不到，標死 30 天：' + cdn.split('.')[0])
         promoteBestCdnNow()
@@ -3240,8 +3475,13 @@ const probeCdnLatency = (cdn) => new Promise((resolve) => {
         // 逾時不直接標死：可能只是當下壅塞。再用較長時間確認真的連不到才標死。
         // 10 秒（不是 4 秒）：實測冷 TLS 握手的上界約 8.8 秒（hw）／6.4 秒（ali），
         // 確認窗必須完整涵蓋它，否則「冷連線」會被當成「連不到」。見 PROBE_TIMEOUT_STRIKES。
-        confirmHostReachable(cdn, CONFIRM_TIMEOUT_MS).then((reachable) => {
-            if (reachable) {
+        confirmHostDead(cdn).then((verdict) => {
+            // v1.3.5：本機斷網時的逾時不是這顆節點的錯，不累計 strike、也不軟隔離（見 confirmHostDead）。
+            if (verdict === 'network-down') {
+                finish({ ms: PROBE_TIMEOUT_MS, reason: 'network-down' })
+                return
+            }
+            if (verdict === 'reachable') {
                 // 確認成功 = 這台其實連得到，只是比探測窗慢。
                 // 記錄**真實耗時**而不是捏造一個平坦的 PROBE_TIMEOUT_MS：後者會讓所有
                 // 逾時節點看起來一樣慢，也讓 EWMA 收到一個假數字（使用者實測看到的
@@ -3290,8 +3530,8 @@ const probeCdnLatency = (cdn) => new Promise((resolve) => {
         // reject = 網路層失敗（DNS / 連線被拒 / TLS）。
         if (timedOut) return
         clearTimeout(timer)
-        // 已知在台灣不解析、本機又從無成功紀錄 → 直接判定，不必再確認一次。
-        if (isPresumedDnsFailHost(cdn)) {
+        // 推定在台灣不可用、本機又從無成功紀錄 → 直接判定，不必再確認一次。
+        if (isPresumedBadHost(cdn)) {
             markHostDead(cdn, 'DNS')
             finish({ ms: Infinity, reason: 'DNS' })
             return
@@ -3300,11 +3540,16 @@ const probeCdnLatency = (cdn) => new Promise((resolve) => {
         // 而標死的代價是 7~30 天不再使用這個節點，誤判的傷害遠大於多發一個請求。
         // 這個情境下 console 本來就已經有一行紅字了，多一行不改變什麼。
         // 同上：2.5 秒不足以涵蓋冷 TLS 握手（實測上界 8.8 秒），改用 CONFIRM_TIMEOUT_MS。
-        confirmHostReachable(cdn, CONFIRM_TIMEOUT_MS).then((reachable) => {
-            if (reachable) {
+        confirmHostDead(cdn).then((verdict) => {
+            if (verdict === 'reachable') {
                 const ms = Math.max(performance.now() - t0, 1)
                 recordCdnLatency(cdn, ms)
                 finish({ ms })
+            } else if (verdict === 'network-down') {
+                // v1.3.5：本機斷網，不是這顆節點的錯（見 confirmHostDead）。
+                // 回有限值而不是 Infinity：reorderCdnsByLatency 會把 Infinity 的節點踢出候選池，
+                // 而「我斷網了」是瞬時狀態，不准動成員資格。排序時 sortKey 會改用它的歷史 EWMA。
+                finish({ ms: PROBE_TIMEOUT_MS, reason: 'network-down' })
             } else {
                 markHostDead(cdn, 'DNS')
                 finish({ ms: Infinity, reason: 'DNS' })
@@ -3322,6 +3567,47 @@ const THRPT_PROBE_MIN_BYTES  = 64 * 1024     // 樣本太小（slow-start 未展
 const THRPT_PROBE_TIMEOUT    = 3000
 const THRPT_BAKEOFF_COOLDOWN = 90 * 1000     // 兩次賽馬最短間隔
 const THRPT_SAMPLE_FRESH_MS  = 60 * 1000     // 此時間內已有真實樣本就跳過該節點
+
+// v1.3.5：賽馬探測改量「隨機、沒被請求過的位置」，不再固定量檔案開頭。
+// 2026-10-25 實機（乾淨 fetch、真實簽名 m4s）：同一段重抓會命中節點的邊緣快取，aliov 從
+// 未快取的 33 Mbps 灌水成 468 Mbps（14 倍）；而檔案開頭是 init segment + 最前面幾個 fragment，
+// 每個播放器起播都會先抓，幾乎每個節點都有快取 —— 固定量 bytes=0- 等於拿「快取命中速度」排名，
+// 跟實際播放時拉到中後段（多半沒快取、要回源）的速度可以差一個數量級。
+// 上限要知道檔案多大，否則選到檔尾之外會回 416（而且是一行 console 紅字）：
+//   - 估計值：playurl 的 bandwidth（平均碼率）× 影片長度，只用一半當上限，吸收 VBR 的偏差。
+//   - 實測值：探測回應的 Content-Range（`bytes a-b/總長`）帶出真實大小，拿到就改用它。
+// 開頭 THRPT_PROBE_SKIP_HEAD 一律跳過；檔案太小（放不下「跳過的開頭 + 一次探測」）就退回量開頭。
+const THRPT_PROBE_SKIP_HEAD  = 1024 * 1024
+const THRPT_PROBE_ALIGN      = 64 * 1024
+const streamSizeHint = new Map()   // URL pathname（換 host 不變）-> { bytes, exact }
+const STREAM_SIZE_HINT_MAX = 32
+const streamPathKey = (url) => { try { return new URL(url).pathname } catch { return '' } }
+// 不在換片時清空：新片的 playurl 可能比 onSpaNavigate 先到，清空會連新片的提示一起刪掉。
+// 改成只保留最近 STREAM_SIZE_HINT_MAX 條（Map 依插入順序，刪最舊的）。
+const setStreamSizeHint = (k, v) => {
+    streamSizeHint.delete(k)
+    streamSizeHint.set(k, v)
+    while (streamSizeHint.size > STREAM_SIZE_HINT_MAX) streamSizeHint.delete(streamSizeHint.keys().next().value)
+}
+const noteStreamSizeEstimate = (url, bytes) => {
+    const k = streamPathKey(url)
+    if (!k || !(bytes > 0)) return
+    const cur = streamSizeHint.get(k)
+    if (cur && cur.exact) return   // 已經有實測值就不讓估計值蓋掉
+    setStreamSizeHint(k, { bytes: Math.floor(bytes * 0.5), exact: false })
+}
+const learnStreamSizeFromContentRange = (url, contentRange) => {
+    const m = /\/(\d+)\s*$/.exec(contentRange || '')
+    const k = streamPathKey(url)
+    if (m && k) setStreamSizeHint(k, { bytes: +m[1], exact: true })
+}
+const pickProbeOffset = (url, wantBytes) => {
+    const hint = streamSizeHint.get(streamPathKey(url))
+    const maxStart = hint ? hint.bytes - wantBytes : 0
+    if (!(maxStart > THRPT_PROBE_SKIP_HEAD)) return 0
+    const span = maxStart - THRPT_PROBE_SKIP_HEAD
+    return THRPT_PROBE_SKIP_HEAD + Math.floor(Math.random() * span / THRPT_PROBE_ALIGN) * THRPT_PROBE_ALIGN
+}
 // 固定門檻沒考慮樣本信心：一次 384KB 探測可能剛好碰到 TCP slow-start 未展開或網路瞬間
 // 空檔，偏差就很大。樣本數越少，門檻拉得越高，越可信才敢用比較低的門檻。
 const switchMarginFor = (samples) => {
@@ -3368,7 +3654,7 @@ let onBakeoffStart        = () => {}
 const probeCdnThroughput = (cdn, sampleUrl, probeBytes, externalSignal) => new Promise((resolve) => {
     if (!cdn || blacklistSet.has(cdn) || knownDeadHosts.has(cdn)) return resolve(null)
     // 縱深防禦：呼叫端已經濾過一次，但這裡是唯一真的把請求送出去的地方，再擋一次。
-    if (isPresumedDnsFailHost(cdn)) return resolve(null)
+    if (isPresumedBadHost(cdn)) return resolve(null)
     const target = replaceUrlHost(sampleUrl, cdn)
     if (!target) return resolve(null)
 
@@ -3395,9 +3681,11 @@ const probeCdnThroughput = (cdn, sampleUrl, probeBytes, externalSignal) => new P
 
     // Bilibili CDN 有防盜鏈機制，'no-referrer' 可能讓 CDN 直接回 403（跟播放器實際
     // 用的 referrer 策略不一致）。改用跟頁面預設一致的策略，避免測速被防盜鏈擋掉。
+    // 每顆候選各自隨機抽一個位置，同一輪裡幾乎不會打到同一段（見 pickProbeOffset 說明）
+    const start = pickProbeOffset(sampleUrl, wantBytes)
     interceptNetResponse.rawFetch(target, {
         method: 'GET',
-        headers: { Range: 'bytes=0-' + (wantBytes - 1) },
+        headers: { Range: 'bytes=' + start + '-' + (start + wantBytes - 1) },
         mode: 'cors',
         credentials: 'omit',
         cache: 'no-store',
@@ -3407,6 +3695,9 @@ const probeCdnThroughput = (cdn, sampleUrl, probeBytes, externalSignal) => new P
         // 403 要跟「慢／逾時」分開回報：它代表這條 URL 換 host 會被拒絕，
         // 再測其餘候選只會多產生幾行紅字（見 hostLockedStreams）。
         if (resp && resp.status === 403) return done({ forbidden: true })
+        // 不論成敗都先記下真實檔案大小（206 的 `bytes a-b/總長`、416 的 `bytes */總長` 都帶得出來），
+        // 下一顆候選就改用實測值選位置。
+        try { learnStreamSizeFromContentRange(sampleUrl, resp && resp.headers && resp.headers.get('content-range')) } catch {}
         if (!resp || (!resp.ok && resp.status !== 206)) return done(null)
         const reader = resp.body && resp.body.getReader ? resp.body.getReader() : null
         if (!reader) return done(null)
@@ -3530,13 +3821,13 @@ const doBakeoff = async (sampleUrl) => {
         const playingHost = getPlayingCdnHost()
         const candidates  = PREFERRED_CDN_LIST
             .filter(c => !blacklistSet.has(c) && !knownDeadHosts.has(c) && !isCdnSoftBlocked(c) && !matchesExclude(c))
-            // ★ 這一行是使用者實測回報的 bug 修正：賽馬只擋 knownDeadHosts，但「已知在台灣
-            // 不解析、還沒被標死」的節點不在其中，於是賽馬會拿**真實 segment URL**去打它們，
+            // ★ 這一行是使用者實測回報的 bug 修正：賽馬只擋 knownDeadHosts，但「推定在台灣
+            // 不可用、還沒被標死」的節點不在其中，於是賽馬會拿**真實 segment URL**去打它們，
             // console 出現 ERR_NAME_NOT_RESOLVED（堆疊 doBakeoff → probeCdnThroughput）。
             // 而且傷害不只是紅字：下面那個迴圈是**逐一 await**，每顆死節點都要卡滿
             // THRPT_PROBE_TIMEOUT（3 秒）才輪到下一顆 —— 兩顆就是 6 秒，這 6 秒本來
             // 應該用來測真正可用的節點，時機還正好落在起播附近。
-            .filter(c => !isPresumedDnsFailHost(c))
+            .filter(c => !isPresumedBadHost(c))
             .filter(c => {
                 if (c === playingHost) return false // 正在播放的節點已由 PerformanceObserver 取真樣本
                 const h = cdnHealth[c]
@@ -3598,7 +3889,11 @@ const doBakeoff = async (sampleUrl) => {
         if (!stale) {
             const best = activeCdnList[0]
             // 勝者明顯比現用節點快 → 強制 worker 把舊主機改寫到勝者（中途切換、不 reload）
-            if (best && playingHost && best !== playingHost) {
+            // v1.3.5：現用節點是 Akamai 時不做。樣本改從 backup 取之後，Akamai 主線路的片子也會跑賽馬，
+            // 但兩邊的數字不是同一種量法：Akamai 是播放器按需拉片的被動樣本，候選是 384KB 的主動探測，
+            // 直接比大小會把「播放器只是沒在趕」誤讀成「Akamai 比較慢」。離開 Akamai 仍交給既有的
+            // fragment 失敗與 Watchdog 卡頓判斷（它們看的是播放有沒有出事，不是兩個數字誰大）。
+            if (best && playingHost && best !== playingHost && !playingHost.endsWith('.akamaized.net')) {
                 const hb = cdnHealth[best], ho = cdnHealth[playingHost]
                 const mb = (hb && hb.samples) ? hb.ewmaMbps : 0
                 const mo = (ho && ho.samples) ? ho.ewmaMbps : 0
@@ -3637,6 +3932,30 @@ const scheduleBakeoff = (sampleUrl) => {
         // 中途換畫質/CDN 導致 sampleUrl 過期時仍打舊 URL。
         runThroughputBakeoff(lastSampleSegmentUrl).catch(() => {})
     }, highBitrate ? 4000 : 1500)
+}
+
+// v1.3.5：切到更高畫質後重新測速。
+// 賽馬原本只在 playurl 回應抵達時排程；B 站切畫質多半直接從同一份 playurl 換 representation，
+// 不會再打一次 API，所以從 1080p 切到 4K 時，「現用節點夠不夠快」一直是用 1080p 的需求判斷的。
+//
+// 由 Watchdog.tick 每秒呼叫，而不是在 syncStreamBitrateFromVideo 登記的當下直接排程：
+//   - 切畫質時播放器常會順帶 seek / 重拉，那段期間 runThroughputBakeoff 會被 inSeekGrace 靜默擋掉，
+//     當下排程等於白白用掉這次機會。留著待辦，等保護窗過了再排。
+//   - 賽馬正在跑或已經排程時也先等，不要疊兩輪。
+// 刻意沿用 skipIfFast=true：現用節點的新鮮樣本已經夠應付新碼率（getRequiredStreamMbps 已改用
+// 新碼率計算）就直接跳過，不多花頻寬；也沿用起播讓路，切畫質後緩衝重新堆積的那幾秒不跟它搶。
+// 冷卻要解除（同換片的作法），否則起播賽馬後 90 秒內切畫質會整個被吃掉——這正是最常見的時機。
+// 頻率由 qualityUpBakeoffDone 約束：同一支片切到同一個碼率只測一次，來回切畫質不會一直重測。
+const maybeRunQualityUpBakeoff = () => {
+    if (!qualityUpPendingBps) return
+    if (disabled || resolvedCdn || !lastSampleSegmentUrl) { qualityUpPendingBps = 0; return }
+    if (inSeekGrace() || bakeoffRunning || bakeoffTimer) return
+    qualityUpBakeoffDone.add(qualityUpPendingBps)
+    log('[Bakeoff] 畫質提高至約 ' + (qualityUpPendingBps / 1e6).toFixed(1) + ' Mbps，重新測速')
+    qualityUpPendingBps = 0
+    bakeoffStartupDefers = 0
+    setLastBakeoffAt(0)
+    scheduleBakeoff()
 }
 
 let dashFragmentErrorHooked = false
@@ -3719,12 +4038,12 @@ const installDashFragmentErrorHook = () => {
 const preconnectCdn = (cdn, force) => {
     try {
         if (!cdn) return
-        // presumed（已知在台灣不解析、本機從無成功紀錄）也要擋：preconnect 走的一樣是
+        // presumed（推定在台灣不可用、本機從無成功紀錄）也要擋：preconnect 走的一樣是
         // DNS 解析，對 NXDOMAIN 的 host 熱身換不到任何東西。這裡的呼叫端目前都先經過
         // getHealthyCdnList()（會濾掉 presumed），但那是呼叫端的性質、不是這個函式的保證——
         // 死節點機制的設計目標寫的是「跳過所有 probe/preconnect」，就該在這裡也守住。
         if (knownDeadHosts.has(cdn) || blacklistSet.has(cdn) || isCdnSoftBlocked(cdn)
-            || matchesExclude(cdn) || isPresumedDnsFailHost(cdn)) return
+            || matchesExclude(cdn) || isPresumedBadHost(cdn)) return
         const id = 'bilicdn-preconn-' + cdn
         const existing = document.getElementById(id)
         if (existing) {
@@ -3909,9 +4228,9 @@ const reorderCdnsByLatency = async (force) => {
 
         const candidates = PREFERRED_CDN_LIST.filter(h => {
             if (knownDeadHosts.has(h) || isCdnSoftBlocked(h)) return false
-            // 已知在台灣不解析的節點一律不發探測請求：那個請求**必定**失敗、必定在
+            // 推定在台灣不可用的節點一律不發探測請求：那個請求**必定**失敗、必定在
             // console 印一行 ERR_NAME_NOT_RESOLVED，而它換不到任何新資訊——
-            // isPresumedDnsFailHost() 的定義本來就是「在已知壞清單裡，而且本機從來沒有
+            // isPresumedBadHost() 的定義本來就是「在已知壞清單裡，而且本機從來沒有
             // 成功過」，答案已經確定了，再打一次只是把它重新確認一遍。
             //
             // ★ 2026-08-19 修正：舊條件是 `isStartupRun && !force && ...`，有兩個洞，
@@ -3928,12 +4247,12 @@ const reorderCdnsByLatency = async (force) => {
             // 使用者實測回報 `upos-sz-mirrorhw ... 959` 那行就是它。偵測機制本身不該是噪音來源。
             // 想確認某個節點在你的網路上到底行不行，唯一有意義的作法是讓它**真的去服務
             // segment**：BiliCDN.setCdn("<完整 host>")，成功後 successes/samples 會寫入，
-            // isPresumedDnsFailHost() 自動失效。
+            // isPresumedBadHost() 自動失效。
             //
             // 跳過探測不會讓它們被誤用：getHealthyCdnList() 在選路時本來就會濾掉 presumed
-            // 節點，diag() 也有專屬的「已知不解析、暫不使用（presumed）」欄位交代原因；
+            // 節點，diag() 也有專屬的「推定不可用、暫不使用（presumed）」欄位交代原因；
             // 萬一真的被指派到 segment，handleSegmentConnError 會立刻收拾。
-            if (isPresumedDnsFailHost(h)) return false
+            if (isPresumedBadHost(h)) return false
             return true
         })
         const results = await Promise.all(candidates.map(probeCdnLatency))
@@ -3976,23 +4295,23 @@ const reorderCdnsByLatency = async (force) => {
         // 所以候選池重建要把 presumed 節點濾掉：一次 `/crossdomain.xml` 的 opaque 回應
         // 根本回答不了「這台能不能服務影片」這個問題，沒有資格解除「已知在台灣不可用」的
         // 推定。真正有資格解除它的是**實際服務過 segment**（那會寫進 successes/samples，
-        // isPresumedDnsFailHost() 隨即轉為 false），而不是一次探測。
+        // isPresumedBadHost() 隨即轉為 false），而不是一次探測。
         activeCdnList.length = 0
         for (const r of results) {
             if (!blacklistSet.has(r.cdn) && !knownDeadHosts.has(r.cdn)
-                && !isPresumedDnsFailHost(r.cdn) && r.ms !== Infinity) {
+                && !isPresumedBadHost(r.cdn) && r.ms !== Infinity) {
                 activeCdnList.push(r.cdn)
             }
         }
         if (activeCdnList.length === 0) {
             PREFERRED_CDN_LIST.forEach(c => {
-                if (!blacklistSet.has(c) && !knownDeadHosts.has(c) && !isPresumedDnsFailHost(c)) {
+                if (!blacklistSet.has(c) && !knownDeadHosts.has(c) && !isPresumedBadHost(c)) {
                     activeCdnList.push(c)
                 }
             })
         }
         // 只重新排序，**不縮減集合**。getHealthyCdnList() 會濾掉「此時此刻」失敗次數
-        // 超標 / 分數過差 / 已知不解析的節點，那是選路當下該有的判斷；但 activeCdnList
+        // 超標 / 分數過差 / 推定不可用的節點，那是選路當下該有的判斷；但 activeCdnList
         // 是整個 session 的候選池母體，被它濾掉的節點若就此從母體消失，一次瞬間的壞狀態
         // 就會變成「接下來兩小時都不再考慮這個節點」——要等下一輪探測（PROBE_CACHE_TTL
         // 兩小時）從 PREFERRED_CDN_LIST 重建才回得來。這是個單向棘輪，候選池只會越來越薄，
@@ -4299,6 +4618,7 @@ const Watchdog = (() => {
         // v1.3.3：先把碼率校正成「實際正在播的畫質」，下面所有門檻
         // （highBitrate / minBps / minAheadEff / targetBytes）才會是對的。
         syncStreamBitrateFromVideo(v)
+        maybeRunQualityUpBakeoff()
 
         // 背景分頁偵測：瀏覽器會把 timer 節流（背景 ≥1/min、5 分後更嚴）。
         // tick 間隔遠大於 1s 代表剛從背景切回，期間 bps/buffered 取樣全部失真，
@@ -4620,8 +4940,8 @@ unsafeWindow.BiliCDN = {
         console.log('軟隔離（session）:', Object.keys(cdnSoftBlockUntil).filter(isCdnSoftBlocked).map(c => c.split('.')[0]))
         console.log('持久死節點（逾時 1d / 一般 7d / DNS 類 30d）:', listDeadHosts()
             .map(e => e.host.split('.')[0] + '(' + e.reason + '，剩 ' + e.daysLeft + 'd)'))
-        console.log('已知不解析、暫不使用（presumed）:',
-            PREFERRED_CDN_LIST.filter(isPresumedDnsFailHost).map(c => c.split('.')[0]))
+        console.log('推定不可用、暫不使用（presumed，不在死節點清單）:',
+            PREFERRED_CDN_LIST.filter(isPresumedBadHost).map(c => c.split('.')[0]))
         console.log('失敗計數:', cdnFailCount)
         console.log('最低需求 Mbps:', +getRequiredStreamMbps().toFixed(2))
         console.log('CDN 吞吐評分:', Object.fromEntries(
@@ -4655,9 +4975,9 @@ unsafeWindow.BiliCDN = {
             black:   [...blacklistSet],
             soft:    Object.fromEntries(Object.entries(cdnSoftBlockUntil).filter(([cdn]) => isCdnSoftBlocked(cdn))),
             dead:    listDeadHosts(),
-            // 已知在台灣不解析、但還沒有實測證據可以標死的節點。它們不會被選路、
+            // 推定在台灣不可用、但還沒有實測證據可以標死的節點。它們不會被選路、
             // 不會進 backup_url、不會被賽馬碰到，但也還沒被判死刑。
-            presumed: PREFERRED_CDN_LIST.filter(isPresumedDnsFailHost),
+            presumed: PREFERRED_CDN_LIST.filter(isPresumedBadHost),
             fail:    { ...cdnFailCount },
             health:  Object.fromEntries(
                 Object.entries(cdnHealth).map(([k, h]) => [k, { ...h, score: getCdnHealthScore(k) }])
@@ -4792,7 +5112,7 @@ unsafeWindow.BiliCDN = {
             console.log('[BiliCDN] 探測完成，候選順序：', [...activeCdnList].map(c => c.split('.')[0]))
             // 這幾台這一輪**刻意沒有被探測**（見候選過濾處說明）。仍然把它們列出來，
             // 否則使用者只會看到「清單裡少了幾台」而不知道發生什麼事。
-            const skipped = PREFERRED_CDN_LIST.filter(isPresumedDnsFailHost)
+            const skipped = PREFERRED_CDN_LIST.filter(isPresumedBadHost)
             if (skipped.length) {
                 const dead = listDeadHosts()
                 console.log('[BiliCDN] 以下節點已知在台灣不可用，本次未探測（避免無謂的失敗請求）：',
@@ -4950,6 +5270,7 @@ const startCdnProbe = () => {
     reorderCdnsByLatency().catch(() => {})
 }
 startCdnProbe()
+if (!disabled) scheduleDeadHostReverify()
 
 // ── Tampermonkey 選單 ────────────────────────────────────────────────
 // 所有控制原本都要開 DevTools console 打指令，對非開發者的一般使用者門檻很高。

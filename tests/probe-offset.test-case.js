@@ -11,7 +11,7 @@ const SIG = '/upgcxcode/11/22/333/333-1-100026.m4s?e=x&deadline=9999999999&os=bo
 const akamUrl = 'https://upos-hz-mirrorakam.akamaized.net' + SIG + '&hdnts=x'
 const cosovUrl = 'https://upos-sz-mirrorcosov.bilivideo.com' + SIG
 // 1080P+ 約 3 Mbps、長度 20 分鐘 → 約 450MB；估計值取一半 = 225MB
-const playurl = () => ({ code: 0, data: { timelength: 1200000, dash: { duration: 1200,
+const playurl = () => ({ code: 0, data: { timelength: 1200000, dash: { duration: 1200, minBufferTime: 1.5, min_buffer_time: 1.5,
     video: [{ id: 112, height: 1080, bandwidth: 3e6, codecs: 'avc1.640032', codecid: 7, base_url: akamUrl, baseUrl: akamUrl, backup_url: [cosovUrl], backupUrl: [cosovUrl] }],
     audio: [{ id: 30280, bandwidth: 192000, base_url: akamUrl, baseUrl: akamUrl, backup_url: [cosovUrl], backupUrl: [cosovUrl] }],
 } } })
@@ -74,7 +74,9 @@ const starts = () => seen.filter(x => /bilivideo/.test(x.host) && x.range).map(x
 
     // ── 整合：playurl → 賽馬 → 實際送出的 Range ──
     T.clearHints()
-    T.transform(playurl()); T.clearTimer(); T.resetHealth()
+    const pu = playurl()
+    T.transform(pu); T.clearTimer(); T.resetHealth()
+    ok(pu.data.dash.minBufferTime === 1.5 && pu.data.dash.min_buffer_time === 1.5, 'playurl 改寫後 minBufferTime 維持 B 站原值（v1.3.6 起不再改寫；點播播放器不讀它）')
     ok(T.hint(T.sample()) && T.hint(T.sample()).bytes === Math.floor(3e6 / 8 * 1200 * 0.5), 'playurl 改寫時依「碼率 × 長度」記下估計值')
     seen.length = 0; T.setLastBakeoffAt(0)
     await T.run(T.sample(), false)

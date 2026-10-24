@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili CDN 台灣優化
 // @namespace    BiliCDN_TW
-// @version      1.3.5
+// @version      1.3.6
 // @description  改善台灣網路觀看 Bilibili 影片時的 CDN 連線穩定度，支援自動切換與卡頓監測
 // @author       jiyunshi <chocosensei214@gmail.com>
 // @license      MIT
@@ -75,7 +75,7 @@ var EnableWorkerIntercept = true
 
 // ── 版本號 ────────────────────────────────────────────────────────────
 // 單一事實來源：優先讀 Tampermonkey 注入的 GM_info（跟著 @version 走，改版不用四處手動同步）。
-const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.3.5'
+const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.3.6'
 const parseVer = (v) => String(v || '0').split('.').map(n => parseInt(n, 10) || 0)
 const verGte = (a, b) => {
     const A = parseVer(a), B = parseVer(b)
@@ -2036,9 +2036,47 @@ const pickStreamUrls = (item, isDash) => {
     return { validUrls, akamaiUrl, biliSrcUrl, highBitrateItem, preferWhitelistPrimary }
 }
 
+// v1.3.5：一般碼率也改以白名單為主線路的條件——「有實測證據」。
+// Akamai 快不快取決於「這段有沒有在它的快取裡」，起播前無從得知；白名單節點則不論冷熱都穩定。
+// 2026-10-25 實機，三支冷門片：
+//   - 實際起播：第一個影片 segment 在 Akamai 上下載了 8 秒（1.1s→9.1s），9.2 秒才開始播放；
+//     同一時間開播賽馬量到香港 161ms、aliov 300ms。播放器沒有切 backup（Akamai 慢但沒失敗），
+//     「Akamai 冷門片提前切走」也救不了（它要等 segment 下載完、而且要連續兩個）。
+//   - 乾淨 fetch、冷門片開頭附近各自沒被請求過的 1MB：香港 0.20~0.73 秒、aliov 0.20 秒，Akamai 7.6~10 秒以上。
+//   - 熱門片兩者相當（Akamai 46~95、香港 40~101 Mbps），所以換過去對熱門片沒有損失。
+// 條件刻意保守：目前最佳（起播模式，不含探索加成）的白名單節點有樣本，且衰減後的吞吐量達到這條串流
+// 碼率的 WHITELIST_PRIMARY_MARGIN 倍。第一次安裝、還沒有任何測速資料時，維持 Akamai 為主（行為同舊版）；
+// 已知綁定節點的串流換 host 必定 403，也維持 Akamai。Akamai 一律保留為第一順位 backup。
+// 證據的半衰期刻意比選路用的 THROUGHPUT_HALFLIFE_MS（8 分鐘）長得多：
+// 這裡回答的不是「哪一顆現在最快」（那要跟著擁塞變動，所以 8 分鐘），而是「白名單整體在這個網路上
+// 跑不跑得到碼率的 3 倍」——這是小時尺度上相對穩定的性質（2026-10-25 香港節點一整天都穩定）。
+// 用 8 分鐘的話，隔 40 分鐘再開一支片證據就衰減光了，又回到冷門片卡在 Akamai 的老路
+// （測速紀錄本來就跨工作階段保存在 cdnHealth_v1，缺的只是這裡不該衰減得這麼快）。
+// 至少 2 筆樣本，不因單一次剛好命中快取的好運就下結論。Akamai 仍是第一順位 backup，判斷錯了有退路。
+// 半衰期 24 小時（最初訂 6 小時）：門檻是碼率 3 倍，1080P+ 約 9 Mbps。6 小時的話 30 Mbps 的證據約 10 小時、
+// 60 Mbps 約 16 小時就失效 —— 等於「每天第一支片」都掉回 Akamai，冷門片就要等好幾秒。24 小時則分別撐
+// 約 41、66 小時，每天使用的人幾乎不會掉回去。代價是換了網路（帶筆電出門、開 VPN）後舊證據可能不準；
+// 退路是：完全不通 → 播放器立刻切 Akamai backup；只是慢 → 開播賽馬約 2 秒內更新紀錄，影響只限那一支片。
+// 沒有拿 HttpDnsAutoPilot 的 networkKey 來作廢證據：它由時區、語言、連線類型、四捨五入後的頻寬組成，
+// 同一台電腦換 Wi-Fi 或開 VPN 時通常完全不變，分辨不出網路換了。
+const WHITELIST_EVIDENCE_HALFLIFE_MS = 24 * 60 * 60 * 1000
+const WHITELIST_EVIDENCE_MIN_SAMPLES = 2
+const WHITELIST_PRIMARY_MARGIN = 3
+const hasWhitelistEvidenceFor = (item, biliSrcUrl) => {
+    if (!item || !biliSrcUrl || isHostLockedStream(biliSrcUrl)) return false
+    const best = getCurrentCdn(STARTUP_PICK)
+    const h = best && !best.endsWith('.akamaized.net') && cdnHealth[best]
+    if (!h || (h.samples || 0) < WHITELIST_EVIDENCE_MIN_SAMPLES || !h.lastSeen) return false
+    const age = Math.max(0, Date.now() - h.lastSeen)
+    const mbps = h.ewmaMbps * Math.pow(0.5, age / WHITELIST_EVIDENCE_HALFLIFE_MS)
+    const itemMbps = (item.bandwidth || 0) / 1e6
+    return itemMbps > 0 && mbps >= itemMbps * WHITELIST_PRIMARY_MARGIN
+}
+
 // 改寫 dash/durl item 的 base_url + backup_url
 // 4K/高碼率：白名單 CDN 為主、Akamai 放 backup，避免首段大 fragment 卡在單一 Akamai。
-// 一般碼率：來源含 Akamai 時仍優先 Akamai，純 bilivideo 則換成最佳白名單。
+// 一般碼率：白名單有實測證據跑得夠快就以白名單為主（見 hasWhitelistEvidenceFor），否則仍優先 Akamai；
+// 純 bilivideo 則換成最佳白名單。
 const transformStreamItem = (item, isDash) => {
     if (!item) return false
     isDash = isDash !== false
@@ -2065,7 +2103,8 @@ const transformStreamItem = (item, isDash) => {
         noteAkamaiHost(akamaiUrl)
     }
 
-    if (akamaiUrl && !preferWhitelistPrimary) {
+    const whitelistFirst = preferWhitelistPrimary || (isDash && !!akamaiUrl && hasWhitelistEvidenceFor(item, biliSrcUrl))
+    if (akamaiUrl && !whitelistFirst) {
         if (isDash) { item.base_url = akamaiUrl; item.baseUrl = akamaiUrl }
         else         { item.url = akamaiUrl }
         // v1.3.3：buildBackupUrls 可能回空陣列（沒有可用的白名單候選、或來源是
@@ -2286,17 +2325,19 @@ const playInfoTransformer = (playInfo) => {
         if (dash) {
             normalizeDashCodecPreference(dash)
 
-            // 只動 minBufferTime；不能加 maxBufferLength —
-            // 4K AV1 + FLAC 設大會觸發 SourceBuffer QuotaExceeded → DecodeError 6003
-            // 4K/高碼率用 2s：4.0 會讓 seek 後多等 ~2s 才開播（長片拖曳特明顯）
+            // v1.3.6：不再改寫 minBufferTime / min_buffer_time（之前一般畫質改 3.0、4K 改 1.0），維持 B 站原值。
+            // 2026-10-25 讀了播放器實際載入的全部 45 支 JS：這個值只在 B 站把 playurl 轉成 MPD 時被存進
+            // manifest（type 寫死 "static"，即點播），之後只有 DVR 範圍、直播延遲、片段可用時間三處讀它——
+            // 全部是 dash.js 的直播（dynamic）路徑。點播完全不讀，改了既不會加快也不會拖慢起播或 seek。
+            // 舊註解說「4.0 會讓 seek 後多等 ~2s」，以現在的播放器而言沒有程式路徑能造成這個效果。
+            // 保留原值的理由：B 站若哪天在點播用到它，原值才是他們預期的。
+            // （同樣不能加 maxBufferLength：4K AV1 + FLAC 設大會觸發 SourceBuffer QuotaExceeded → DecodeError 6003。）
             try {
                 const vids = (dash.video || [])
                 const auds = (dash.audio || [])
                 const maxV = vids.reduce((m, v) => Math.max(m, v.bandwidth || 0), 0)
                 const maxA = auds.reduce((m, a) => Math.max(m, a.bandwidth || 0), 0)
                 const is4K = vids.some(v => (v.height || 0) >= 2160 || (v.bandwidth || 0) > 12e6)
-                // 4K：首播先讓畫面更快進入 canplay；穩定度交給 Watchdog/HEVC/CDN 切換處理。
-                const minBuf = is4K ? 1.0 : 3.0
                 // v1.3.3：記下完整畫質清單，讓 Watchdog 之後能用實際播放的畫質校正碼率
                 // （見 syncStreamBitrateFromVideo）。這裡的 maxV 只當起播前的初估值，
                 // 起播那 3~5 秒 Watchdog 本來就在 grace 期不判定，校正得及。
@@ -2307,8 +2348,6 @@ const playInfoTransformer = (playInfo) => {
                     audioBps: maxA,
                 }
                 setBufferTargetFromBitrate(maxV + maxA, is4K || (maxV + maxA) > 12e6)
-                dash.minBufferTime   = minBuf
-                dash.min_buffer_time = minBuf
             } catch {}
 
             const extras = []
@@ -3709,6 +3748,7 @@ const probeCdnThroughput = (cdn, sampleUrl, probeBytes, externalSignal) => new P
                 if (bytes >= THRPT_PROBE_MIN_BYTES) {
                     recordCdnThroughput(cdn, bytes, dl, 1)
                     recordCdnLatency(cdn, ttfb)
+                    clearBakeoffMiss(cdn)
                     done({ cdn })   // 只有 cdn 會被讀；數值已在上一行入帳
                 } else done(null)
                 return
@@ -3717,8 +3757,36 @@ const probeCdnThroughput = (cdn, sampleUrl, probeBytes, externalSignal) => new P
             pump()
         }).catch(() => done(null))
         pump()
-    }).catch(() => done(null))
+    }).catch(() => {
+        // 連 header 都沒拿到就逾時／失敗 = 這一輪對它完全沒有資訊（見 noteBakeoffMiss）。
+        // 換片造成的外部中止不算它的錯。
+        if (!(externalSignal && externalSignal.aborted)) noteBakeoffMiss(cdn)
+        done(null)
+    })
 })
+
+// v1.3.6：測速「完全沒有回應」的節點排到後面，連續兩次就暫時隔離。
+// 2026-10-25 實機：開播賽馬裡 ali 兩次都撐滿 THRPT_PROBE_TIMEOUT（3 秒）、一個位元組都沒收到（status 0）。
+// 逾時不產生樣本，於是它永遠是「還沒測過」：每一輪都會被排進候選、每一輪都賠掉 3 秒，
+// 而賽馬是序列執行的，排在它後面的節點全部跟著晚 3 秒才量到。
+// 計數存在 cdnHealth（跨工作階段保存），重整頁面也記得它上次沒回應；任何一次成功測速就清零。
+const BAKEOFF_MISS_SOFTBLOCK_AT = 2
+const BAKEOFF_MISS_SOFTBLOCK_MS = 10 * 60 * 1000
+const getBakeoffMisses = (cdn) => (cdnHealth[cdn] && cdnHealth[cdn].bakeoffMisses) || 0
+const noteBakeoffMiss = (cdn) => {
+    const h = ensureCdnHealth(cdn)
+    if (!h) return
+    h.bakeoffMisses = (h.bakeoffMisses || 0) + 1
+    if (h.bakeoffMisses >= BAKEOFF_MISS_SOFTBLOCK_AT) {
+        softBlockCdn(cdn, 'bakeoff-no-response', BAKEOFF_MISS_SOFTBLOCK_MS)
+        log('[Bakeoff] ' + cdn.split('.')[0] + ' 連續 ' + h.bakeoffMisses + ' 次測速沒有回應，暫時隔離 10 分鐘')
+    }
+    scheduleCdnHealthSave()
+}
+const clearBakeoffMiss = (cdn) => {
+    const h = cdnHealth[cdn]
+    if (h && h.bakeoffMisses) { h.bakeoffMisses = 0; scheduleCdnHealthSave() }
+}
 
 // 序列探測（非並行）避免候選互搶台灣上行頻寬而互相低估。只測「缺新樣本」的候選。
 // skipIfFast：現用節點已經跑得夠快時要不要直接跳過整輪賽馬。
@@ -3833,6 +3901,8 @@ const doBakeoff = async (sampleUrl) => {
                 const h = cdnHealth[c]
                 return !(h && h.samples && h.lastSeen && (now - h.lastSeen) < THRPT_SAMPLE_FRESH_MS)
             })
+            // v1.3.6：上次測速沒有回應的排到最後（見 noteBakeoffMiss）。sort 是穩定的，其餘維持 PREFERRED 順序。
+            .sort((a, b) => getBakeoffMisses(a) - getBakeoffMisses(b))
             .slice(0, 4)
 
         // 高碼率（4K）用較大測速量，分得出節點快慢；一般畫質維持小量省頻寬

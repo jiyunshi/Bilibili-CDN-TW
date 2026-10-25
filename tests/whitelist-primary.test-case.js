@@ -32,6 +32,13 @@ const isAkam = u => /akamaized\.net/.test(u)
         console.log(`\n${pass} passed, ${fail} failed`); process.exit(0)
     }
 
+    // ── v1.4.0：MP4／FLV（durl）沒有證據也以白名單為主（實機：Akamai 對 187MB 的 MP4 回 504，播放器攔不到、救不了）──
+    T.reset()
+    const durl = { order: 1, size: 187e6, url: akamUrl.replace('.m4s', '.mp4'), backup_url: [cosovUrl.replace('.m4s', '.mp4')] }
+    T.transform(durl, false)
+    console.log('  MP4：主線路 ' + new URL(durl.url).hostname.split('.')[0] + '，backup ' + (durl.backup_url || []).map(u => new URL(u).hostname.split('.')[0]).join('、'))
+    ok(!isAkam(durl.url) && (durl.backup_url || []).some(isAkam), 'MP4（durl）沒有測速證據也以白名單為主線路，Akamai 留在 backup')
+
     T.reset(); T.seed(60)
     let it = run()
     ok(it.base_url.includes(HK3) && it.baseUrl === it.base_url, '有實測證據（60 Mbps ≥ 碼率 3 倍）→ 主線路改為最佳白名單節點（香港）')

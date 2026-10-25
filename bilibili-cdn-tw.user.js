@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili CDN 台灣優化
 // @namespace    BiliCDN_TW
-// @version      1.3.7
+// @version      1.4.0
 // @description  改善台灣網路觀看 Bilibili 影片時的 CDN 連線穩定度，支援自動切換與卡頓監測
 // @author       jiyunshi <chocosensei214@gmail.com>
 // @license      MIT
@@ -65,17 +65,9 @@ var PreferredVideoCodec = 'hevc'
 // false = 放行（頁面其他功能，或其他擴充功能，若也用到 WebRTC 才需要關）
 var BlockWebRTC = true
 
-// EnableWorkerIntercept：是否攔截 new Worker() 並改寫其內部 segment 請求的 CDN host。
-// 改進工單 B 已埋入 BiliCDN.workerStats() 量測這段攔截是否真的有效（Bilibili 播放器
-// 是否真的用 Worker 抓影片分段目前不確定）；觀察數週、確認 mediaSeen 長期為 0 後，
-// 可以把這個值改成 false 停用（不用等緊急發版）——設定面板「攔截修改影片 CDN」
-// checkbox 停用的是「改寫」，這個開關停用的是整段攔截機制本身，範圍更大。
-// 預設 true：維持目前行為不變，真正決定要不要拿掉這 250 行程式碼要等 B 的數據出來。
-var EnableWorkerIntercept = true
-
 // ── 版本號 ────────────────────────────────────────────────────────────
 // 單一事實來源：優先讀 Tampermonkey 注入的 GM_info（跟著 @version 走，改版不用四處手動同步）。
-const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.3.7'
+const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.0'
 const parseVer = (v) => String(v || '0').split('.').map(n => parseInt(n, 10) || 0)
 const verGte = (a, b) => {
     const A = parseVer(a), B = parseVer(b)
@@ -128,6 +120,12 @@ const PLAYURL_PREFIXES = [
     'https://api.bilibili.com/x/player/wbi/ugc/playurl',
     'https://api.bilibili.com/x/player/season/playurl',
     'https://api.bilibili.com/x/player/wbi/season/playurl',
+    // v1.4.0：番劇換集改用這支（fetch、GET、`//` 開頭），播放資訊在 data.video_info.dash。
+    // 2026-10-25 實機：整頁載入的那一集有改寫，點選集換到下一集後 12 個片段打到 Akamai。
+    'https://api.bilibili.com/ogv/player/playview',
+    // v1.4.0：番劇正片前的播放檢查，回應同樣帶完整播放資訊（data.video_info.dash，實機為片頭片段）。
+    // 2026-10-25 實機：番劇整頁載入時 6 個片頭片段走 Akamai（這次剛好已快取、11～51ms；冷門時就會卡）。
+    'https://api.bilibili.com/ogv/player/pre/check/drm',
 ]
 // v1.3.7：播放器有些請求用「省略協定」的網址（`//api.bilibili.com/x/player/wbi/playurl?…`）。
 // 2026-10-25 實機：切換 Hi-Res／杜比音軌時重新取得的 playurl 就是這種寫法，而所有判斷都用
@@ -147,7 +145,7 @@ const isPlayUrlApi = (url) => {
     try {
         const u = new URL(url)
         return u.hostname === 'api.bilibili.com'
-            && /\/player\/.*playurl/.test(u.pathname)
+            && (/\/player\/.*playurl/.test(u.pathname) || /^\/ogv\/player\/(playview|pre\/check\/drm)/.test(u.pathname))
     } catch {
         return false
     }
@@ -294,6 +292,8 @@ try {
             GM_setValue('cdnBlacklist', '[]')
             GM_deleteValue('probeCache_v1')
         }
+        // v1.4.0：Worker 攔截已移除（播放器不在 Worker 裡下載片段，量測自 v1.3.1 起 created=0），清掉它的量測存檔
+        GM_deleteValue('workerStats_v1')
         GM_setValue('blicdnVersion', VERSION)
     }
 } catch {}
@@ -687,7 +687,7 @@ const softBlockCdn = (cdn, reason, durationMs) => {
 const MIN_THROUGHPUT_SAMPLE_BYTES = 128 * 1024
 const MIN_THROUGHPUT_SAMPLE_MS    = 5
 
-const recordCdnThroughput = (cdn, bytes, durationMs, playbackRate) => {
+const recordCdnThroughput = (cdn, bytes, durationMs, playbackRate, skipAkamaiCheck) => {
     if (!cdn || !bytes || !durationMs || durationMs <= 0) return
     if (blacklistSet.has(cdn) || knownDeadHosts.has(cdn) || isUnstableCdnHost(cdn)) return
     const mbps = (bytes * 8) / durationMs / 1000
@@ -708,12 +708,15 @@ const recordCdnThroughput = (cdn, bytes, durationMs, playbackRate) => {
     // 吞吐量只有在「傳輸夠大、久到脫離 slow-start 並攤平 TTFB」時才有意義。不夠大的
     // 傳輸仍然計入 h.bytes（面板的累計下載量要準），但**不進 ewmaMbps、不算一個樣本**
     // ——samples 的語意就是「有幾次有效的吞吐量量測」，計分與抖動估計都靠它加權。
-    if (bytes < MIN_THROUGHPUT_SAMPLE_BYTES || durationMs < MIN_THROUGHPUT_SAMPLE_MS) {
+    // v1.4.0：例外是「小但花了很久」的傳輸——噴發假象的特徵是位元組少、時間極短；位元組少卻花了 1 秒以上，
+    // 那是真的慢（例如慢片段補發時，1.5 秒只收到 100KB），要算進去，否則慢的證據會被這條門檻丟掉。
+    const slowSmallTransfer = bytes < MIN_THROUGHPUT_SAMPLE_BYTES && durationMs >= 1000
+    if ((bytes < MIN_THROUGHPUT_SAMPLE_BYTES && !slowSmallTransfer) || durationMs < MIN_THROUGHPUT_SAMPLE_MS) {
         scheduleCdnHealthSave()
         return
     }
     // v1.3.5：Akamai 不在賽馬候選裡，走到這裡的 Akamai 樣本一定是播放器真實下載的 segment
-    noteAkamaiSegmentSpeed(cdn, bytes, mbps)
+    if (!skipAkamaiCheck) noteAkamaiSegmentSpeed(cdn, bytes, mbps)
     // 均值之外同步追蹤「抖動」：緩衝夠不夠是看均速，卡不卡頓看的是穩不穩——同樣均速
     // 15~35 Mbps 抖動的節點，比穩定在 20 Mbps 的節點更容易讓緩衝瞬間見底。用標準的
     // EWMA 變異數遞增公式（跟均值同一個 alpha，兩者衰減步調一致），第一個樣本沒有
@@ -738,6 +741,36 @@ const recordCdnThroughput = (cdn, bytes, durationMs, playbackRate) => {
         h.slowSamples = Math.max(0, h.slowSamples - 1)
     }
     scheduleCdnHealthSave()
+}
+
+// v1.4.0：播放時的被動樣本累積到 PASSIVE_SAMPLE_MIN_BYTES 才算一筆。
+// B 站的片段很小（實測 95～830KB），扣掉 TTFB 後的傳輸時間常常只有 4～90ms，量到的是 TCP 一口氣噴完的瞬間速率：
+// 同一台香港節點連續幾段量出 26～212 Mbps。均值在需求 10 倍就封頂、不太傷選路，但變異數會把抖動扣分撐大，
+// 好節點之間的排名變成雜訊。曾試過把單筆樣本夾在上限內：實機假抖動消失，但模擬器 1080P 卡頓 2.1→4.1 秒
+// （把會掉包的節點的高點也夾掉了，等於丟資訊）→ 撤回。這裡改成「同一節點連續片段合併」：總位元組 ÷ 總傳輸時間，
+// 噴發被平均掉、但不丟任何資訊。超過 PASSIVE_SAMPLE_MAX_AGE_MS 沒湊滿就重新累積（不把相隔太久的狀況混在一起）。
+// Akamai 冷門片提早切走仍逐片段判斷（它要的是「連續幾段都慢」，合併會讓反應變慢）。
+// 主動測速（賽跑、測速探測）是一次 256～768KB 的連續下載，本來就不是這個問題，照舊直接記。
+const PASSIVE_SAMPLE_MIN_BYTES  = 1024 * 1024
+const PASSIVE_SAMPLE_MAX_AGE_MS = 15000
+const passiveThroughputAcc = new Map()   // host -> { bytes, ms, since }
+const notePassiveThroughput = (cdn, bytes, durationMs, playbackRate) => {
+    if (!cdn || !(bytes > 0) || !(durationMs > 0)) return
+    try { noteAkamaiSegmentSpeed(cdn, bytes, (bytes * 8) / durationMs / 1000) } catch {}
+    if (blacklistSet.has(cdn) || knownDeadHosts.has(cdn) || isUnstableCdnHost(cdn)) return   // 同 recordCdnThroughput
+    const now = Date.now()
+    let a = passiveThroughputAcc.get(cdn)
+    if (!a || now - a.since > PASSIVE_SAMPLE_MAX_AGE_MS) { a = { bytes: 0, ms: 0, since: now }; passiveThroughputAcc.set(cdn, a) }
+    a.bytes += bytes
+    a.ms += durationMs
+    if (a.bytes >= PASSIVE_SAMPLE_MIN_BYTES) {
+        passiveThroughputAcc.delete(cdn)
+        recordCdnThroughput(cdn, a.bytes, a.ms, playbackRate, true)
+    } else {
+        // 位元組照樣計入（面板的累計下載量要準），只是還不算一筆速度樣本
+        const h = ensureCdnHealth(cdn)
+        if (h) { h.bytes += bytes; h.lastSeen = now }
+    }
 }
 
 const recordCdnPenalty = (cdn, hard) => {
@@ -936,7 +969,16 @@ const getHealthyCdnList = (opts) => {
     const notFailing = base.filter(item => (cdnFailCount[item.cdn] || 0) < CDN_FAIL_THRESHOLD)
     const pool       = notFailing.length ? notFailing : base
     const usable     = pool.filter(item => !isCdnStronglyBad(item.cdn))
-    const indexed    = usable.length ? usable : pool
+    // v1.4.0：已經量過、而且速度撐不起目前畫質的節點，不拿真實播放去「探索」它。
+    // UCB 的探索加成會讓久沒用的節點偶爾被選上；時間一久慢的紀錄衰減掉，探索加成又把它拉回來——
+    // 用正在播的影片去試一台已知 8 Mbps 的節點播 4K（需要 20 Mbps），代價就是卡頓。模擬器（假時鐘、含慢片段補發）：
+    // 4K 卡頓 231 秒裡有 867 秒（6 輪合計）來自 16 次選到 ali02，固定只用 aliov 只有 2.5 秒。
+    // 這裡看的是沒有衰減的 ewmaMbps（「量到過多快」是事實，不因為時間久就變成不知道）；重新評估交給測速探測
+    // （不影響播放、每輪都會挑不新鮮的節點量），量到變快自然回來。全部都不夠快時不過濾，照原本的規則選。
+    const requiredMbps = getRequiredStreamMbps(undefined, 'steady')
+    const knownTooSlow = item => !!(item.health && item.health.samples > 0 && item.health.ewmaMbps < requiredMbps)
+    const feasible     = usable.filter(item => !knownTooSlow(item))
+    const indexed      = feasible.length ? feasible : (usable.length ? usable : pool)
 
     indexed.sort((a, b) => {
         const aHasSamples = !!(a.health && a.health.samples)
@@ -1099,7 +1141,6 @@ const promoteBestCdnNow = () => {
     const warmList = activeCdnList.slice(0, 3)
     preconnectBatch(warmList.filter(h => h !== playingNow), !inSeekGrace())
     if (playingNow) preconnectCdn(playingNow, false)
-    syncWorkerCdnTarget()
     return best
 }
 
@@ -1343,7 +1384,7 @@ const noteSegmentBytes = (cdn, xhr, startedAt, url, alreadyReportedBytes) => {
         const durationMs = Math.max(1, Date.now() - startedAt)
         const remaining  = Math.max(0, bytes - (alreadyReportedBytes || 0))
         if (remaining) Watchdog.noteExternalBytes(cdn, remaining)
-        recordCdnThroughput(cdn, bytes, durationMs, latestPlaybackRate)
+        notePassiveThroughput(cdn, bytes, durationMs, latestPlaybackRate)
         noteSegmentAccounted(url)
     } catch {}
 }
@@ -1997,12 +2038,29 @@ const buildBackupUrls = (biliSrcUrl) => {
     let primaryHost
     try { primaryHost = new URL(biliSrcUrl).hostname } catch { primaryHost = '' }
     // backup 也用起播模式：主流失敗時會直接切到這裡，同樣禁不起「探索中獎」。
-    return getHealthyCdnList(STARTUP_PICK)
+    const cands = getHealthyCdnList(STARTUP_PICK)
         .filter(cdn => cdn !== primaryHost)
         .filter(cdn => !matchesExclude(cdn) && !knownDeadHosts.has(cdn) && !blacklistSet.has(cdn))
-        .slice(0, 2)
-        .map(cdn => replaceUrlHost(biliSrcUrl, cdn))
-        .filter(Boolean)
+    // v1.4.0：第一個 backup 一定來自不同機房。只取「分數前兩名」的話，香港三台（同在 Equinix HK、
+    // 103.151.151.x）分數都高，主線路香港 05 時 backup 就是香港 03、香港 01——那個機房或那條線路出事，
+    // 三條網址會一起失效，播放器的 backup 重試等於沒有。不同機房的優先，其餘照分數。
+    const primaryGroup = cdnSiteGroup(primaryHost)
+    const picked = []
+    const diverse = cands.find(cdn => cdnSiteGroup(cdn) !== primaryGroup)
+    if (diverse) picked.push(diverse)
+    for (const cdn of cands) {
+        if (picked.length >= 2) break
+        if (!picked.includes(cdn)) picked.push(cdn)
+    }
+    return picked.map(cdn => replaceUrlHost(biliSrcUrl, cdn)).filter(Boolean)
+}
+
+// 同一機房的節點會一起出事。目前唯一確認同機房的是 BCache 系列（cn-<地區>-<業者>-<機房>-<編號>，
+// 例如 cn-hk-eq-01-03／05／01 都在 Equinix HK 同一個網段），以去掉最後編號的前綴當群組；其他鏡像各自獨立。
+const cdnSiteGroup = (host) => {
+    if (!host) return ''
+    const m = /^(cn-[a-z]+-[a-z]+-\d+)-\d+\.bilivideo\.com$/i.exec(host)
+    return m ? m[1].toLowerCase() : host
 }
 
 // B 站長片/4K 有時會在深層欄位保留原始 backup URL；
@@ -2155,7 +2213,13 @@ const transformStreamItem = (item, isDash) => {
         noteAkamaiHost(akamaiUrl)
     }
 
-    const whitelistFirst = preferWhitelistPrimary || (isDash && !!akamaiUrl && hasWhitelistEvidenceFor(item, biliSrcUrl))
+    // v1.4.0：MP4／FLV（durl，整部影片一個檔案）一律以白名單為主線路、Akamai 降為 backup。
+    // 2026-10-25 實機（重置測速紀錄後的冷門新片，B 站給的是 format=mp4、187MB）：B 站原本的主線路是 cosov（2.1 Mbps），
+    // 舊規則把主線路換成 Akamai，而 Akamai 對這個檔案回源失敗、回 504；播放器透過 <video src> 直接下載，腳本攔不到
+    // （起播賽跑、Watchdog 換節點都救不了），播了 60 秒影片只前進 13 秒。同一檔案香港節點 13.9 Mbps、首位元組 0.09 秒。
+    // 換主機失敗（例如綁定節點回 403）時，B 站播放器自己有 MP4 換 backup 網址的重試（core 的 tryFlvBackupUrl），會退回 Akamai。
+    const whitelistFirst = preferWhitelistPrimary || (!isDash && !!biliSrcUrl)
+        || (isDash && !!akamaiUrl && hasWhitelistEvidenceFor(item, biliSrcUrl))
     if (akamaiUrl && !whitelistFirst) {
         if (isDash) { item.base_url = akamaiUrl; item.baseUrl = akamaiUrl }
         else         { item.url = akamaiUrl }
@@ -2369,7 +2433,9 @@ const playInfoTransformer = (playInfo) => {
             return
         }
     } else {
-        video_info = playInfo.data
+        // v1.4.0：/ogv/player/playview（番劇換集）的播放資訊包在 data.video_info 底下，比照上面 result.video_info 的處理
+        const d = playInfo.data
+        video_info = (d && d.dash === undefined && d.durl === undefined && d.video_info) ? d.video_info : d
     }
 
     try {
@@ -2520,7 +2586,28 @@ const interceptNetResponse = (function (theWindow) {
             }
 
             this._interceptUrl = toAbsoluteUrl(url)
+            // v1.4.0：起播賽跑要能在 send 前換主機重新 open（見 StartupRace），重新 open 會清掉標頭，所以要記下來
+            this._openMethod = method
+            this._openRest   = rest
+            this._reqHeaders = null
             return super.open(method, url, ...rest)
+        }
+
+        setRequestHeader(name, value) {
+            if (this._originCdn) (this._reqHeaders || (this._reqHeaders = [])).push([name, value])
+            return super.setRequestHeader(name, value)
+        }
+
+        abort() {
+            this._abortRequested = true
+            return super.abort()
+        }
+
+        // v1.4.0：慢片段補發（見 Watchdog 的 maybeHedgeSlowSegment）。把逾時設成「已經過去的時間」，
+        // 瀏覽器立刻以 timeout 結束這個請求；B 站下載器的 ontimeout 會照它自己的邏輯換下一個網址重試，
+        // 重試請求經過 open() 時再被改寫到別的節點。不偽造任何回應。
+        _forceTimeout(elapsedMs) {
+            try { super.timeout = Math.max(1, Math.floor(elapsedMs)); return true } catch { return false }
         }
 
         // v1.3.4：HTTPDNS 阻擋不再補送 error 事件，改成合成一個 503 JSON 回應。
@@ -2579,13 +2666,38 @@ const interceptNetResponse = (function (theWindow) {
                 return
             }
 
+            // v1.4.0：起播賽跑（見 StartupRace）。主線路是 Akamai 的新片段，先暫緩送出，
+            // 同時向 Akamai 與最佳白名單節點各要開頭 256KB，誰先到正式請求就送給誰。
+            if (!disabled && this._originCdn && !this._raceDone) {
+                const plan = StartupRace.plan(this._interceptUrl, this._reqHeaders)
+                if (plan) {
+                    this._raceDone = true
+                    StartupRace.run(plan).then(winner => {
+                        if (this._abortRequested) return
+                        if (winner && winner !== plan.akamaiHost) {
+                            const newUrl = replaceUrlHost(this._interceptUrl, winner)
+                            if (newUrl) {
+                                try {
+                                    super.open(this._openMethod || 'GET', newUrl, ...(this._openRest || []))
+                                    ;(this._reqHeaders || []).forEach(([k, v]) => { try { super.setRequestHeader(k, v) } catch {} })
+                                    this._interceptUrl  = newUrl
+                                    this._redirectedCdn = winner
+                                } catch {}
+                            }
+                        }
+                        try { this.send(...args) } catch {}
+                    })
+                    return
+                }
+            }
+
             // 只在真正的網路錯誤（error 事件）或 4xx/5xx 計失敗
             // status=0 多半是 player 主動 abort（seek/換畫質），不計失敗
             if (this._originCdn) {
                 const cdn  = this._redirectedCdn || this._originCdn
                 const self = this
                 const segStartedAt = Date.now()
-                const segToken = Watchdog.noteSegmentStart(cdn)
+                const segToken = Watchdog.noteSegmentStart(cdn, this)
                 this.addEventListener('loadend', () => Watchdog.noteSegmentEnd(segToken))
                 let firstByteAt = 0
                 let progressEvents = 0
@@ -2608,6 +2720,7 @@ const interceptNetResponse = (function (theWindow) {
                     if (!firstByteAt) firstByteAt = Date.now()   // 純傳輸時間的起點，扣掉連線/排隊的 TTFB
                     progressEvents++
                     const loaded = (e && e.loaded) || 0
+                    Watchdog.noteSegmentProgress(segToken, loaded, (e && e.lengthComputable && e.total) || 0)
                     const delta = loaded - lastProgressLoaded
                     if (delta > 0) {
                         lastProgressLoaded = loaded
@@ -2788,7 +2901,7 @@ const interceptNetResponse = (function (theWindow) {
                                         // Math.max(1,...) 下限反而把 Mbps 撐爆成離譜天文數字（實測見過
                                         // 500+ Mbps 的假樣本毒化 EWMA）。這種情況退回含 TTFB 的完整耗時。
                                         const durationBase = chunkCount >= 2 ? (firstChunkAt || fetchStartedAt) : fetchStartedAt
-                                        recordCdnThroughput(targetCdn, counted, Math.max(1, Date.now() - durationBase), latestPlaybackRate)
+                                        notePassiveThroughput(targetCdn, counted, Math.max(1, Date.now() - durationBase), latestPlaybackRate)
                                     }
                                     return
                                 }
@@ -2803,7 +2916,7 @@ const interceptNetResponse = (function (theWindow) {
                             const bytes = cl ? (parseInt(cl, 10) || 0) : 0
                             if (bytes) {
                                 Watchdog.noteExternalBytes(targetCdn, bytes)
-                                recordCdnThroughput(targetCdn, bytes, Math.max(1, Date.now() - fetchStartedAt), latestPlaybackRate)
+                                notePassiveThroughput(targetCdn, bytes, Math.max(1, Date.now() - fetchStartedAt), latestPlaybackRate)
                                 noteSegmentAccounted(effectiveUrl)
                             }
                         }
@@ -2868,88 +2981,8 @@ const interceptNetResponse = (function (theWindow) {
     return interceptNetResponse
 })(unsafeWindow)
 
-// 若播放器把 segment 請求放進 Worker，補一層輕量 fetch/XHR host 改寫。
-// classic Worker 用 importScripts；module Worker 僅包同源 script，避免跨源 module import 破壞 player。
-const biliCdnWorkers = new Set()
-const getWorkerCdnTarget = () => resolvedCdn || getBestCdn() || activeCdnList[0] || PREFERRED_CDN_LIST[0] || ''
-
-// ── Worker 攔截有效性量測（改進工單 B）───────────────────────────────────
-// 這 250 行是全檔最複雜、最脆弱的部分（動態組字串 + importScripts 遠端網址），
-// 且下方 new Worker 攔截處自己都不確定播放器是否真的用 Worker 抓 segment。埋四個分層指標，
-// 用真實數據決定去留：created（攔到幾次 new Worker）→ netCalls（Worker 內
-// 發了幾次網路請求）→ mediaSeen（其中幾次是影片分段）→ rewrites（實際改寫
-// 了幾次）。隱私聲明：所有計數只存在使用者本機（GM_setValue），腳本不會
-// 自動上傳任何資料，回報完全靠使用者手動 BiliCDN.workerStats() 複製貼上。
-const WORKER_STATS_KEY = 'workerStats_v1'
-const WORKER_STATS_SAVE_MS = 5000
-const WORKER_STATS_MAX_SAMPLES = 5
-const workerStats = (() => {
-    try {
-        const raw = JSON.parse(GM_getValue(WORKER_STATS_KEY) || '{}') || {}
-        return {
-            created: +raw.created || 0,
-            netCalls: +raw.netCalls || 0,
-            mediaSeen: +raw.mediaSeen || 0,
-            rewrites: +raw.rewrites || 0,
-            bytes: +raw.bytes || 0,
-            firstAt: +raw.firstAt || 0,
-            lastAt: +raw.lastAt || 0,
-            samples: Array.isArray(raw.samples) ? raw.samples.slice(0, WORKER_STATS_MAX_SAMPLES) : [],
-        }
-    } catch {
-        return { created: 0, netCalls: 0, mediaSeen: 0, rewrites: 0, bytes: 0, firstAt: 0, lastAt: 0, samples: [] }
-    }
-})()
-let workerStatsSaveTimer = null
-const flushWorkerStats = () => {
-    if (workerStatsSaveTimer) { clearTimeout(workerStatsSaveTimer); workerStatsSaveTimer = null }
-    try { GM_setValue(WORKER_STATS_KEY, JSON.stringify(workerStats)) } catch {}
-}
-const scheduleWorkerStatsSave = () => {
-    if (workerStatsSaveTimer) return
-    workerStatsSaveTimer = setTimeout(() => { workerStatsSaveTimer = null; flushWorkerStats() }, WORKER_STATS_SAVE_MS)
-}
-// patch 可含 created/netCalls/mediaSeen/rewrites/bytes（累加）與 sample（worker script 網址樣本）
-const bumpWorkerStats = (patch) => {
-    if (!patch) return
-    const now = Date.now()
-    if (!workerStats.firstAt) workerStats.firstAt = now
-    workerStats.lastAt = now
-    ;['created', 'netCalls', 'mediaSeen', 'rewrites', 'bytes'].forEach(k => {
-        if (patch[k]) workerStats[k] += patch[k]
-    })
-    if (patch.sample && !workerStats.samples.includes(patch.sample)) {
-        workerStats.samples.push(patch.sample)
-        if (workerStats.samples.length > WORKER_STATS_MAX_SAMPLES) workerStats.samples.shift()
-    }
-    scheduleWorkerStatsSave()
-}
-window.addEventListener('pagehide', flushWorkerStats)
-// 判讀規則見改進工單 B：created=0 → 可砍；netCalls=0 → 可砍；mediaSeen=0 → 可砍；
-// mediaSeen>0 → 保留（rewrites=0 時也保留，代表當時剛好不需改寫，不代表沒作用）。
-const summarizeWorkerStats = () => {
-    const days = workerStats.firstAt ? Math.max(1, Math.round((Date.now() - workerStats.firstAt) / 86400000)) : 0
-    let verdict = '尚無資料（先播放影片數分鐘再查）'
-    if (workerStats.firstAt) {
-        if (workerStats.created === 0) verdict = '完全沒攔到 Worker → 可考慮移除'
-        else if (workerStats.netCalls === 0) verdict = '有 Worker 但從未發出網路請求 → 可考慮移除'
-        else if (workerStats.mediaSeen === 0) verdict = '有網路請求但都不是影片分段 → 可考慮移除'
-        else verdict = '有攔到影片分段 → 建議保留'
-    }
-    return {
-        created: workerStats.created,
-        netCalls: workerStats.netCalls,
-        mediaSeen: workerStats.mediaSeen,
-        rewrites: workerStats.rewrites,
-        bytesMB: +((workerStats.bytes || 0) / 1024 / 1024).toFixed(2),
-        observedDays: days,
-        samples: [...workerStats.samples],
-        verdict,
-    }
-}
-
-// worker 強制改寫清單：soft-block / strongly-bad 的 preferred 主機（worker 預設不認這些），
-// 外加賽馬勝者切換時明確指定的舊主機。讓中途切換對 worker segment 流量也生效。
+// 強制改寫清單：賽馬勝者中途切換、Akamai 冷門片提早切走、Watchdog 判定卡在 Akamai 時，
+// 明確指定要改寫走的主機（normalizeMediaUrl 會把它們的 segment 改寫到目前最佳節點）。
 // 用有時效的 Map 而非永久 Set：一次偶發錯誤不該讓某個 host 整支長片都被流放，
 // softBlockCdn 早就有 TTL 的設計，這裡跟它保持一致。
 const forcedRedirectHosts = new Map()   // host -> expireAt
@@ -2964,6 +2997,110 @@ const isForcedRedirect = (host) => {
     if (t <= Date.now()) { forcedRedirectHosts.delete(host); return false }
     return true
 }
+
+// v1.4.0：起播賽跑（hedged first segment）。
+// 沒有測速紀錄時（第一次安裝、換了網路），一般畫質照設計以 Akamai 為主線路（見 hasWhitelistEvidenceFor）；
+// Akamai 只有片段在它的快取裡才快，冷門片第一個影片片段實測要 8 秒以上，而播放器只有「首位元組 2 秒沒到」才換備援。
+// 這裡不需要事前證據：每支片的影片軌、音訊軌第一個大型片段請求（Range ≥ 128KB）如果要送去 Akamai，先暫緩，
+// 同時向 Akamai 與最佳白名單節點各要這個片段開頭的 STARTUP_RACE_BYTES，先下載完的贏，正式請求送給它。
+// 白名單贏了就把這個 Akamai 主機改寫 10 分鐘（同 Akamai 冷門片提早切走），之後的片段直接走白名單。
+// 白名單節點在使用者的網路上連不到、或這條串流換主機會 403，Akamai 自然勝出——不寫死任何節點。
+// 兩邊量到的速度都記成測速資料，下一支片就有證據可用（hasWhitelistEvidenceFor），不必每支片都賽。
+// 代價：兩邊都快（熱門片）時起播多等一次 256KB 下載；最多等 STARTUP_RACE_MAX_MS。
+// 上限必須遠小於 2 秒：B 站下載器「首位元組 2.0 秒沒到就 abort、換備援」的計時從播放器呼叫 send 那一刻起算，
+// 賽跑期間正式請求被暫緩，這段時間也算在裡面。1.2 秒 + 正式請求的首位元組（白名單實測 0.05～0.15 秒）仍在 2 秒內。
+// 門檻 64KB：音訊片段很小（192kbps 每段約 100KB），128KB 的話音訊永遠不賽，整支片的音訊都留在冷的 Akamai 上
+// （2026-10-25 實機：4K 影片軌本來就走白名單，音訊軌每段在 Akamai 上要約 1 秒）。賽跑量取 256KB 與片段大小的較小者。
+const STARTUP_RACE_BYTES      = 256 * 1024
+const STARTUP_RACE_MIN_RANGE  = 64 * 1024
+const STARTUP_RACE_MAX_MS     = 1200
+const StartupRace = (() => {
+    const raced = new Set()   // 已經賽過的片段檔案路徑（每支片的每條軌道一次）
+    const history = []        // 最近 10 次的結果，給 BiliCDN.diag() 顯示（起播當下的 log 常常來不及被看到）
+    const parseRange = (headers) => {
+        const h = (headers || []).find(([k]) => String(k).toLowerCase() === 'range')
+        const m = h && /bytes=(\d+)-(\d+)/.exec(String(h[1]))
+        return m ? { start: +m[1], end: +m[2] } : null
+    }
+    const plan = (url, headers) => {
+        try {
+            if (!url || !isAkamaiUrl(url)) return null
+            const u = new URL(url)
+            if (isForcedRedirect(u.hostname) || isHostLockedStream(url)) return null
+            const r = parseRange(headers)
+            if (!r || r.end - r.start + 1 < STARTUP_RACE_MIN_RANGE) return null
+            if (raced.has(u.pathname)) return null
+            const challenger = getCurrentCdn(STARTUP_PICK)
+            if (!challenger || challenger.endsWith('.akamaized.net') || isPresumedBadHost(challenger)) return null
+            raced.add(u.pathname)
+            if (raced.size > 200) raced.delete(raced.values().next().value)
+            return { url, akamaiHost: u.hostname, challenger, start: r.start,
+                bytes: Math.min(STARTUP_RACE_BYTES, r.end - r.start + 1) }
+        } catch { return null }
+    }
+    // 回傳先下載完的主機；時限內都沒下載完，回傳收到較多位元組的一邊；都失敗回傳 null（照原本送 Akamai）
+    const run = (p) => new Promise((resolve) => {
+        const ctrl = new AbortController()
+        const t0 = performance.now()
+        const got = {}
+        let settled = false
+        let timer = null
+        const finish = (winner, why) => {
+            if (settled) return
+            settled = true
+            clearTimeout(timer)
+            try { ctrl.abort() } catch {}
+            const ms = Math.round(performance.now() - t0)
+            history.push({ at: new Date().toLocaleTimeString(), track: (p.url.match(/-(\d+)\.m4s/) || [])[1] || '?',
+                akamai: p.akamaiHost.split('.')[0], challenger: p.challenger.split('.')[0],
+                winner: winner ? winner.split('.')[0] : '照原本', why, ms })
+            if (history.length > 10) history.shift()
+            log('[起播賽跑] ' + p.akamaiHost.split('.')[0] + ' vs ' + p.challenger.split('.')[0] + ' → '
+                + (winner ? winner.split('.')[0] : '照原本') + '（' + why + '，' + ms + 'ms）')
+            if (winner && winner !== p.akamaiHost) {
+                addForcedRedirect(p.akamaiHost)
+                try { promoteBestCdnNow() } catch {}
+            }
+            resolve(winner)
+        }
+        timer = setTimeout(() => {
+            const a = got[p.akamaiHost] || 0, c = got[p.challenger] || 0
+            finish(a === 0 && c === 0 ? null : (c > a ? p.challenger : p.akamaiHost), '逾時，比收到的量')
+        }, STARTUP_RACE_MAX_MS)
+        let failures = 0
+        const leg = (host) => {
+            const target = host === p.akamaiHost ? p.url : replaceUrlHost(p.url, host)
+            got[host] = 0
+            if (!target) { if (++failures === 2) finish(null, '兩邊都失敗'); return }
+            const legT0 = performance.now()
+            let ttfb = 0
+            interceptNetResponse.rawFetch(target, {
+                method: 'GET', mode: 'cors', credentials: 'omit', cache: 'no-store', signal: ctrl.signal,
+                referrerPolicy: 'strict-origin-when-cross-origin',
+                headers: { Range: 'bytes=' + p.start + '-' + (p.start + p.bytes - 1) },
+            }).then(resp => {
+                if (!resp || (resp.status !== 206 && !resp.ok)) throw new Error('status ' + (resp && resp.status))
+                ttfb = performance.now() - legT0
+                const reader = resp.body.getReader()
+                const pump = () => reader.read().then(({ done, value }) => {
+                    if (value) got[host] += value.byteLength
+                    if (done || got[host] >= p.bytes) {
+                        const total = performance.now() - legT0
+                        // 量到的是真實片段、冷熱與播放器當下一致，記成測速資料（下一支片就有證據）
+                        try { recordCdnThroughput(host, got[host], Math.max(1, total - ttfb), 1); recordCdnLatency(host, ttfb) } catch {}
+                        finish(host, '先下載完 ' + Math.round(got[host] / 1024) + 'KB')
+                        return
+                    }
+                    return pump()
+                })
+                return pump()
+            }).catch(() => { if (!settled && ++failures === 2) finish(null, '兩邊都失敗') })
+        }
+        leg(p.akamaiHost)
+        leg(p.challenger)
+    })
+    return { plan, run, history: () => history.slice() }
+})()
 // v1.3.5：Akamai 冷門片提早切走。
 // 一般畫質（非 4K）時 transformStreamItem 保留 Akamai 當主線路，而 Akamai 的表現取決於「這段有沒有在它的
 // 快取裡」。2026-10-25 實機（乾淨 fetch、真實簽名 m4s、只量沒被請求過的位置）：
@@ -3001,336 +3138,9 @@ const noteAkamaiSegmentSpeed = (host, bytes, mbps) => {
     try { Watchdog.noteCdnSwitched() } catch {}
     promoteBestCdnNow()
     preconnectBatch([target], true)
-    syncWorkerCdnTarget()
     log('[Akamai] 冷門片：連續 ' + strikes + ' 個 segment 低於需求（' + mbps.toFixed(1) + ' < ' + required.toFixed(1)
         + ' Mbps），改寫到 ' + target.split('.')[0] + '（' + th.ewmaMbps.toFixed(1) + ' Mbps），10 分鐘後再試 Akamai')
 }
-
-const getWorkerForceList = () => {
-    const out = new Set([...forcedRedirectHosts.keys()].filter(isForcedRedirect))
-    PREFERRED_CDN_LIST.forEach(h => {
-        if (isCdnSoftBlocked(h) || isCdnStronglyBad(h)) out.add(h)
-    })
-    out.delete(getWorkerCdnTarget())
-    return [...out]
-}
-
-const syncWorkerCdnTarget = () => {
-    const target = getWorkerCdnTarget()
-    if (!target) return
-    const force = getWorkerForceList()
-    biliCdnWorkers.forEach(worker => {
-        try {
-            worker.postMessage({ __biliCdnSetTarget: target, __biliCdnForce: force })
-        } catch {
-            biliCdnWorkers.delete(worker)
-        }
-    })
-}
-
-// 使用者透過設定面板 checkbox 停用/啟用時同步通知既有 Worker，
-// 否則已建立的 Worker 會在「停用」後仍持續改寫 segment host（disabled 只擋新建 Worker）。
-const syncWorkerDisabledState = () => {
-    biliCdnWorkers.forEach(worker => {
-        try {
-            worker.postMessage({ __biliCdnDisabled: disabled })
-        } catch {
-            biliCdnWorkers.delete(worker)
-        }
-    })
-}
-
-const setupClassicWorkerIntercept = () => {
-    // 安全開關。關閉時整段攔截機制不生效，biliCdnWorkers
-    // 維持空 Set——syncWorkerCdnTarget()/syncWorkerDisabledState() 的 forEach 在空 Set
-    // 上單純不做事，不會因為開關關閉而丟例外。程式碼刻意保留不刪，等 workerStats()
-    // 數據確認這段真的沒用後，才在未來版本整段移除（見 CHANGELOG）。
-    if (!EnableWorkerIntercept) return
-    try {
-        const OriginalWorker = unsafeWindow.Worker
-        if (!OriginalWorker || OriginalWorker.__biliCdnPatched) return
-
-        const preferred = [...PREFERRED_CDN_LIST]
-        const excludes = [...ExcludeHostKeywords]
-        const targetHost = getWorkerCdnTarget()
-        if (!targetHost) return
-        const forceList = getWorkerForceList()
-
-        const sharedWorkerPatch = (originalUrl) => `
-let BILICDN_TARGET_HOST = ${JSON.stringify(targetHost)};
-let BILICDN_FORCE = ${JSON.stringify(forceList)};
-const BILICDN_PREFERRED = ${JSON.stringify(preferred)};
-const BILICDN_EXCLUDES = ${JSON.stringify(excludes)};
-const BILICDN_BASE = ${JSON.stringify(originalUrl)};
-let BILICDN_BYTES_PORT = null;
-let BILICDN_DISABLED = false;
-// Worker 被包成 blob 之後 self.location 會變成 blob:https://... ，任何相對路徑
-// （./x.js、/api/y）若拿 blob URL 當基準解析就會壞掉。統一先轉絕對路徑再判斷/改寫。
-const biliCdnAbs = (url) => {
-    try { return new URL(String(url), BILICDN_BASE).href; } catch { return String(url); }
-};
-const biliCdnMatchesExclude = (host) => BILICDN_EXCLUDES.some((kw) => kw && host.indexOf(kw) !== -1);
-// 必須跟主執行緒的 isUnstableCdnHost 同一套規則（v1.3.5 對齊）：白名單優先（香港 BCache），
-// BCache 地區碼 2~8 碼（舊的 [a-z]{2} 會漏判 cn-hbwh-cm 這類四碼地區，主執行緒在 v1.3.3 就修了，這裡一直沒跟上）。
-const biliCdnIsUnstable = (host) =>
-    !!host && BILICDN_PREFERRED.indexOf(host) === -1
-        && (/\\.mcdn\\.bilivideo\\.(cn|com)$/i.test(host)
-        || /\\.szbdyd\\.com$/i.test(host)
-        || (/^cn-[a-z]{2,8}-/i.test(host) && host.endsWith('.bilivideo.com')));
-self.addEventListener('message', (event) => {
-    const data = event && event.data;
-    if (data && data.__biliCdnSetTarget && typeof data.__biliCdnSetTarget === 'string') {
-        BILICDN_TARGET_HOST = data.__biliCdnSetTarget;
-    }
-    if (data && Array.isArray(data.__biliCdnForce)) {
-        BILICDN_FORCE = data.__biliCdnForce;
-    }
-    if (data && data.__biliCdnBytesPort) {
-        BILICDN_BYTES_PORT = data.__biliCdnBytesPort;
-        biliCdnFlushStat();
-    }
-    if (data && typeof data.__biliCdnDisabled === 'boolean') {
-        BILICDN_DISABLED = data.__biliCdnDisabled;
-    }
-});
-// 回報 Worker 內下載的 segment 位元組給主執行緒（主執行緒 PerformanceObserver 看不到 Worker 流量）
-const biliCdnNoteSeg = (url, bytes) => {
-    if (!BILICDN_BYTES_PORT || !bytes) return;
-    try {
-        const h = new URL(url).hostname;
-        if (h.endsWith('.bilivideo.com') || h.endsWith('.bilivideo.cn')) {
-            BILICDN_BYTES_PORT.postMessage({ host: h, bytes: +bytes });
-        }
-    } catch (e) {}
-};
-// 量測（改進工單 B）：netCalls / mediaSeen / rewrites 三個埋點，節流回報給主執行緒
-// 統計。port 到位前的請求不能漏記，先本地累積到 BILICDN_STAT，port 到位（見上方
-// __biliCdnBytesPort 分支）或每 BILICDN_REPORT_MS 才送一次，不逐請求 postMessage。
-let BILICDN_STAT = { netCalls: 0, mediaSeen: 0, rewrites: 0 };
-let BILICDN_STAT_TIMER = null;
-const biliCdnFlushStat = () => {
-    if (!BILICDN_BYTES_PORT) return;
-    if (!BILICDN_STAT.netCalls && !BILICDN_STAT.mediaSeen && !BILICDN_STAT.rewrites) return;
-    try {
-        BILICDN_BYTES_PORT.postMessage({ __stat: BILICDN_STAT });
-        BILICDN_STAT = { netCalls: 0, mediaSeen: 0, rewrites: 0 };
-    } catch (e) {}
-};
-const biliCdnBumpStat = (key) => {
-    BILICDN_STAT[key]++;
-    if (!BILICDN_STAT_TIMER) {
-        BILICDN_STAT_TIMER = setTimeout(() => { BILICDN_STAT_TIMER = null; biliCdnFlushStat(); }, BILICDN_REPORT_MS);
-    }
-};
-const biliCdnIsMedia = (url) => {
-    try {
-        const u = new URL(url);
-        const h = u.hostname;
-        if (!(h.endsWith('.bilivideo.com') || h.endsWith('.bilivideo.cn') || biliCdnIsUnstable(h))) return false;
-        return u.pathname.endsWith('.m4s') || u.pathname.endsWith('.flv') || u.pathname.includes('/upgcxcode/');
-    } catch {
-        return false;
-    }
-};
-const biliCdnNeedsRedirect = (host) =>
-    !!host && (biliCdnIsUnstable(host) || biliCdnMatchesExclude(host)
-        || BILICDN_FORCE.indexOf(host) !== -1
-        || BILICDN_PREFERRED.indexOf(host) === -1);
-const biliCdnRewrite = (url) => {
-    try {
-        if (BILICDN_DISABLED) return url;
-        biliCdnBumpStat('netCalls');
-        const abs = biliCdnAbs(url);
-        if (!biliCdnIsMedia(abs)) return abs;
-        biliCdnBumpStat('mediaSeen');
-        const u = new URL(abs);
-        if (!biliCdnNeedsRedirect(u.hostname) || u.hostname === BILICDN_TARGET_HOST) return abs;
-        u.hostname = BILICDN_TARGET_HOST;
-        u.port = '';
-        biliCdnBumpStat('rewrites');
-        return u.toString();
-    } catch {
-        return url;
-    }
-};
-const BILICDN_REPORT_MS = 200;
-if (self.fetch) {
-    const OriginalFetch = self.fetch.bind(self);
-    self.fetch = (input, init) => {
-        const url = input instanceof Request ? input.url : String(input);
-        const rewritten = biliCdnRewrite(url);
-        if (rewritten !== url && input instanceof Request) {
-            input = new Request(rewritten, {
-                method: input.method,
-                headers: input.headers,
-                body: (input.method === 'GET' || input.method === 'HEAD') ? undefined : input.body,
-                mode: input.mode === 'navigate' ? 'same-origin' : input.mode,
-                credentials: input.credentials,
-                cache: input.cache,
-                redirect: input.redirect,
-                referrer: input.referrer,
-                referrerPolicy: input.referrerPolicy,
-                integrity: input.integrity,
-                signal: input.signal,
-            });
-        } else if (rewritten !== url) {
-            input = rewritten;
-        }
-        return OriginalFetch(input, init).then((resp) => {
-            try {
-                // 跟主執行緒同一個教訓：resp 在收到 header 就 resolve，body 通常還在傳。
-                // 用 content-length 在這一刻一次性入帳會把整包位元組記在 TTFB 那一刻，
-                // 造成主執行緒的 Watchdog 看到「這秒突然滿血、之後好幾秒卻是 0 位元組」
-                // 的假停滯。改用 tee() 逐 chunk 節流回報，比照主執行緒的做法。
-                if (resp && resp.body && typeof resp.body.tee === 'function' && biliCdnIsMedia(resp.url || rewritten)) {
-                    const [forCaller, forCount] = resp.body.tee();
-                    const out = new Response(forCaller, { status: resp.status, statusText: resp.statusText, headers: resp.headers });
-                    const reader = forCount.getReader();
-                    let pending = 0, lastReport = 0;
-                    const flush = (force) => {
-                        const now = Date.now();
-                        if (!pending) return;
-                        if (!force && now - lastReport < BILICDN_REPORT_MS) return;
-                        lastReport = now;
-                        biliCdnNoteSeg(resp.url || rewritten, pending);
-                        pending = 0;
-                    };
-                    const pump = () => reader.read().then(({ done, value }) => {
-                        if (value && value.byteLength) { pending += value.byteLength; flush(false); }
-                        if (done) { flush(true); return; }
-                        return pump();
-                    }).catch(() => flush(true));
-                    pump();
-                    return out;
-                }
-                // 沒有 tee()（極舊環境或 opaque/no-body 回應）：退回一次性用 content-length
-                // 概算，跟主執行緒同款 fallback 保持一致，避免這條路徑直接零位元組入帳。
-                if (resp && biliCdnIsMedia(resp.url || rewritten)) {
-                    const cl = resp.headers && resp.headers.get && resp.headers.get('content-length');
-                    const bytes = cl ? (parseInt(cl, 10) || 0) : 0;
-                    if (bytes) biliCdnNoteSeg(resp.url || rewritten, bytes);
-                }
-            } catch (e) {}
-            return resp;
-        });
-    };
-}
-if (self.XMLHttpRequest) {
-    const OriginalXHR = self.XMLHttpRequest;
-    self.XMLHttpRequest = class XMLHttpRequest extends OriginalXHR {
-        open(method, url, ...rest) {
-            const rewritten = biliCdnRewrite(String(url));
-            try {
-                let lastLoaded = 0;
-                // XHR 的 'load' 要等整包下載完才觸發，跟主執行緒同樣的問題：大 segment 下載
-                // 期間主執行緒完全看不到進度。改掛 'progress'，用累計 loaded 的增量即時回報。
-                this.addEventListener('progress', (e) => {
-                    try {
-                        if (!biliCdnIsMedia(rewritten)) return;
-                        const loaded = (e && e.loaded) || 0;
-                        const delta = loaded - lastLoaded;
-                        if (delta > 0) { lastLoaded = loaded; biliCdnNoteSeg(rewritten, delta); }
-                    } catch (e) {}
-                });
-                this.addEventListener('load', () => {
-                    try {
-                        if (!biliCdnIsMedia(rewritten)) return;
-                        const cl = this.getResponseHeader && this.getResponseHeader('content-length');
-                        let n = cl ? parseInt(cl, 10) : 0;
-                        if (!n && this.response) {
-                            if (this.response.byteLength) n = this.response.byteLength;
-                            else if (typeof this.response === 'string') n = this.response.length;
-                        }
-                        // progress 已經逐步報過 lastLoaded，這裡只補沒被 progress 算到的尾巴，避免重複入帳
-                        const remaining = Math.max(0, n - lastLoaded);
-                        if (remaining) biliCdnNoteSeg(rewritten, remaining);
-                    } catch (e) {}
-                });
-            } catch (e) {}
-            return super.open(method, rewritten, ...rest);
-        }
-    };
-}
-`
-
-        const classicWorkerPatch = (originalUrl) => `
-${sharedWorkerPatch(originalUrl)}
-const BiliCdnOriginalImportScripts = self.importScripts.bind(self);
-self.importScripts = (...urls) => BiliCdnOriginalImportScripts(...urls.map((url) => {
-    try { return new URL(url, BILICDN_ORIGINAL).href; } catch { return url; }
-}));
-const BILICDN_ORIGINAL = ${JSON.stringify(originalUrl)};
-importScripts(BILICDN_ORIGINAL);
-`
-
-        const moduleWorkerPatch = (originalUrl) => `
-${sharedWorkerPatch(originalUrl)}
-import(${JSON.stringify(originalUrl)}).catch((e) => { try { console.error('[BiliCDN] worker module import 失敗', e); } catch (e2) {} });
-`
-
-        const registerWorker = (worker) => {
-            biliCdnWorkers.add(worker)
-            setTimeout(() => {
-                try { worker.postMessage({ __biliCdnSetTarget: getWorkerCdnTarget(), __biliCdnForce: getWorkerForceList(), __biliCdnDisabled: disabled }) } catch {}
-            }, 0)
-            // 建立專屬 MessagePort 接收 Worker 回報的 segment 下載量（不污染播放器訊息通道、不跨分頁）
-            try {
-                const mc = new MessageChannel()
-                mc.port1.onmessage = (e) => {
-                    const d = e && e.data
-                    if (d && d.bytes && Watchdog && Watchdog.noteExternalBytes) Watchdog.noteExternalBytes(d.host, d.bytes)
-                    if (d && d.bytes) bumpWorkerStats({ bytes: d.bytes })
-                    if (d && d.__stat) bumpWorkerStats(d.__stat)
-                }
-                worker.postMessage({ __biliCdnBytesPort: mc.port2 }, [mc.port2])
-            } catch {}
-            const originalTerminate = worker.terminate && worker.terminate.bind(worker)
-            if (originalTerminate) {
-                worker.terminate = () => {
-                    biliCdnWorkers.delete(worker)
-                    return originalTerminate()
-                }
-            }
-            return worker
-        }
-
-        unsafeWindow.Worker = class Worker extends OriginalWorker {
-            constructor(scriptURL, options) {
-                if (disabled) {
-                    return super(scriptURL, options)
-                }
-                try {
-                    const originalUrl = new URL(String(scriptURL), location.href).href
-                    if (originalUrl.startsWith('blob:') || originalUrl.startsWith('data:')) {
-                        return super(scriptURL, options)
-                    }
-                    const isModule = !!(options && options.type === 'module')
-                    if (isModule && new URL(originalUrl).origin !== location.origin) {
-                        return super(scriptURL, options)
-                    }
-                    // 觀察用：Bilibili 網頁播放器主流實作是主執行緒 MSE，不確定 segment 真的會走
-                    // Worker。開 BiliCDN.verbose(true) 觀察一段時間，若從未看到這行，代表這整段
-                    // Worker 攔截對目前播放器版本沒有實際效果，未來可以考慮整塊移除。
-                    log('[Worker] patched: ' + originalUrl)
-                    bumpWorkerStats({ created: 1, sample: originalUrl })
-                    const source = isModule ? moduleWorkerPatch(originalUrl) : classicWorkerPatch(originalUrl)
-                    const blob = new Blob([source], { type: 'application/javascript' })
-                    const blobUrl = URL.createObjectURL(blob)
-                    const worker = registerWorker(super(blobUrl, options))
-                    // 30 秒可能太短：若 Worker 因故需要重新讀取自己的 script URL（少見但存在），
-                    // 太早 revoke 會失敗。延長到 5 分鐘；一個 blob URL 佔用記憶體很小，
-                    // Worker 終止時瀏覽器也會回收，不會造成長期洩漏。
-                    setTimeout(() => URL.revokeObjectURL(blobUrl), 5 * 60 * 1000)
-                    return worker
-                } catch (e) {
-                    return super(scriptURL, options)
-                }
-            }
-        }
-        unsafeWindow.Worker.__biliCdnPatched = true
-    } catch (e) {}
-}
-setupClassicWorkerIntercept()
 
 // DOM 工具
 const waitForElm = (selector, timeoutMs) => new Promise((resolve, reject) => {
@@ -4057,7 +3867,7 @@ const doBakeoff = async (sampleUrl, reason = '') => {
 
         if (!stale) {
             const best = activeCdnList[0]
-            // 勝者明顯比現用節點快 → 強制 worker 把舊主機改寫到勝者（中途切換、不 reload）
+            // 勝者明顯比現用節點快 → 把舊主機列入強制改寫，之後的 segment 改到勝者（中途切換、不 reload）
             // v1.3.5：現用節點是 Akamai 時不做。樣本改從 backup 取之後，Akamai 主線路的片子也會跑賽馬，
             // 但兩邊的數字不是同一種量法：Akamai 是播放器按需拉片的被動樣本，候選是 384KB 的主動探測，
             // 直接比大小會把「播放器只是沒在趕」誤讀成「Akamai 比較慢」。離開 Akamai 仍交給既有的
@@ -4185,7 +3995,6 @@ const installDashFragmentErrorHook = () => {
         }
         promoteBestCdnNow()
         preconnectBatch(getHealthyCdnList().slice(0, 3), true)
-        syncWorkerCdnTarget()
         if (lastSampleSegmentUrl && currentStreamBitsPerSec / 1e6 >= 12) {
             setLastBakeoffAt(0)
             // 已經真的出錯（fragment 下載失敗）才會走到這裡，不能被「現用節點目前還算快」擋掉。
@@ -4382,7 +4191,6 @@ const reorderCdnsByLatency = async (force) => {
                     if (activeCdnList.length) {
                         promoteBestCdnNow()
                         preconnectBatch(activeCdnList.slice(0, 3))
-                        syncWorkerCdnTarget()
                         return
                     }
                 }
@@ -4504,7 +4312,6 @@ const reorderCdnsByLatency = async (force) => {
 
         if (activeCdnList[0]) {
             preconnectBatch(activeCdnList.slice(0, 3), force)
-            syncWorkerCdnTarget()
         }
     } finally {
         reorderRunning = false
@@ -4519,20 +4326,6 @@ const Watchdog = (() => {
     const TICK_MS           = 1000
     const STALL_MAX         = 3
     const MIN_BPS_FLOOR     = 350 * 1024
-    const URGENT_BUFFER_SEC = 5
-    // ★ 換節點的**危險線**，跟上面的目標線是兩回事。
-    // minAheadEff（高碼率 30 秒）是「我們希望存這麼多」的目標；換節點是很貴的動作
-    // （丟掉熱連線、重做 TCP+TLS、懲罰殘留 10 分鐘），只有在緩衝真的快撐不住時才該做。
-    //
-    // 用目標線當觸發條件會產生**結構性誤判**：B 站播放器抓 segment 是一陣一陣的
-    //（抓一批 → 閒置等緩衝被播掉 → 再抓一批）。閒置期間 buffered.end 不動、
-    // bufferAhead 持續下降 —— 完全正常，但這跟「停滯 + 緩衝流失」的特徵一模一樣。
-    // 只要播放器自己的穩態緩衝低於我們的目標線（4K 幾乎必然如此），**每一個閒置週期
-    // 都會被判成卡頓**，於是每隔幾秒就換一次節點。
-    //
-    // 使用者實測 log 的鐵證：賽馬量到 cos 有 29.3 Mbps（高於該片需求的 25.65 Mbps），
-    // 卻照樣被判「buffered 停滯」並懲罰。速度明明夠，問題出在判定條件。
-    const STALL_DANGER_SEC  = 10
     const REACHED_RECHECK_BUFFER_SEC = 10
     const SWITCH_COOL       = 5000
     // 剛 reset（開播/換片）那幾秒，TCP/TLS 連線還在 slow-start，量到的瞬時 bps 天生偏低，
@@ -4624,6 +4417,95 @@ const Watchdog = (() => {
     // 2026-10-25 實機：4K 影片片段在 Akamai 上下載 7.9 秒，同時音訊片段在 aliov 正常下載完，被罰的是 aliov。
     const inflightSegs = new Map()
     let inflightSeq = 0
+    // v1.4.0：最近幾次停滯懲罰的當下情境（播放位置、緩衝、影片長度、卡住的片段）。
+    // 2026-10-25 長時間測試：aliov 在片尾前 8 秒（播放完全順暢）被判「buffered 停滯」，事後無法重現，也查不出原因——
+    // 當下的數字沒有留下來。之後再發生時，BiliCDN.buf() 直接看得到判定依據。
+    let lastStallContext = null
+    const recentPenalties = []
+    // v1.4.0：這一秒沒有做卡住判定的原因（null = 有判定）。例外規則各自都有理由（P1-7 後逐條檢查過），
+    // 不刪；改成讓「現在是哪一條在作用」看得見，之後有誤判或漏判時直接對得上。
+    let stallSkipReason = '尚未開始'
+
+    // v1.4.0：慢片段補發（P1-6）。Watchdog 原本要等「緩衝見底、終點不動」連續幾秒才換節點，使用者已經看到轉圈。
+    // 這裡看的是「卡住緩衝的那個片段照目前速度來不及在緩衝用完前下載完」，提早處理：
+    //   1. 讓那個節點之後的請求改走別處（Akamai：強制改寫 10 分鐘；白名單：軟隔離＋強制改寫 60 秒，
+    //      軟隔離讓它暫時不是最佳節點，強制改寫讓 seek 保護期內的重試也會被改寫）；
+    //   2. 把這個 XHR 的逾時設成「已經過去的時間」→ B 站下載器的 ontimeout 照它自己的邏輯重試下一個網址，
+    //      重試經過 open() 時被改寫到別的節點。不偽造回應、不動播放器的狀態機（core 的 HTTPLoader：ontimeout → eU → 重試、輪換 urls）。
+    // 只處理 XHR（播放器實際用的）；快下載完（≥80%）的不動；每個請求一次。
+    // 頻率限制分兩層：同一個節點 HEDGE_COOLDOWN_MS 內不重複處理（它已經被隔離了）；全域 HEDGE_BURST_WINDOW_MS 內
+    // 最多 HEDGE_BURST_MAX 次，避免整體網路變慢時一個接一個把所有節點都隔離。v1.4.0 以前是「全域 8 秒冷卻」：
+    // 補發換到的節點也掉包時（模擬器：aliov 慢 → 換 ali → ali 下一段掉包）第二次救援被冷卻擋住，一次卡 263 秒。
+    const HEDGE_MIN_ELAPSED_MS = 1500
+    const HEDGE_BUFFER_SEC     = 6
+    const HEDGE_COOLDOWN_MS    = 8000
+    const HEDGE_BURST_WINDOW_MS = 30000
+    const HEDGE_BURST_MAX       = 3
+    const recentHedges = []
+    const hedgeTimes = []        // 最近的補發時間（全域頻率限制）
+    const hedgeHostAt = new Map() // host -> 最近一次補發時間
+    let hedgeTestArmed = false
+    const maybeHedgeSlowSegment = (bufferAhead, videoPaused) => {
+        if (disabled || videoPaused) return
+        const now = Date.now()
+        while (hedgeTimes.length && now - hedgeTimes[0] > HEDGE_BURST_WINDOW_MS) hedgeTimes.shift()
+        if (!hedgeTestArmed && (bufferAhead >= HEDGE_BUFFER_SEC || hedgeTimes.length >= HEDGE_BURST_MAX)) return
+        let oldest = null
+        inflightSegs.forEach(e => {
+            if (!e.xhr || e.hedged) return
+            if (!hedgeTestArmed && now - (hedgeHostAt.get(e.host) || 0) < HEDGE_COOLDOWN_MS) return
+            if (!oldest || e.t < oldest.t) oldest = e
+        })
+        if (!oldest) return
+        const elapsed = now - oldest.t
+        let remainingMs = Infinity
+        if (oldest.loaded > 0 && oldest.total > 0) {
+            if (oldest.loaded >= oldest.total * 0.8) return
+            remainingMs = (oldest.total - oldest.loaded) / (oldest.loaded / elapsed)
+        }
+        const forced = hedgeTestArmed && elapsed >= 150
+        if (!forced) {
+            if (elapsed < HEDGE_MIN_ELAPSED_MS) return
+            if (remainingMs < bufferAhead * 1000 * 0.8) return
+            // v1.4.0：片段本身要真的慢——目前下載速度低於這條串流的碼率（下載跟不上播放）。
+            // 只看「趕不趕得上緩衝」的話，開播時緩衝是 0，再快的下載都「趕不上」：模擬器裡 4K 第一個 10MB 片段
+            // 在最快的 aliov 上正常要 2～3 秒，1.5 秒時就被判成慢片段、aliov 被隔離 60 秒，只剩會掉包的 ali 可用，
+            // 又碰上 8 秒冷卻 → 一次卡 263 秒。過了 1.5 秒連一個位元組都沒有（速度 0）照樣算慢。
+            const rateMbps = oldest.loaded > 0 ? (oldest.loaded * 8) / elapsed / 1000 : 0
+            if (rateMbps >= getRequiredStreamMbps(undefined, 'steady')) return
+        }
+        hedgeTestArmed = false
+        oldest.hedged = true
+        hedgeTimes.push(now)
+        hedgeHostAt.set(oldest.host, now)
+        const host = oldest.host
+        // v1.4.0：把這次「慢」的證據留下來。請求被逾時後不會產生任何速度樣本，節點的分數還停在先前的高點，
+        // 60 秒隔離一結束又被選回來——模擬器裡偶爾整段掉包的節點（實機的 ali 就是這樣）因此被反覆踩雷：
+        // 4K 卡頓 484 秒，固定只用 aliov 只有 2.5 秒。記下「已下載量 ÷ 已經過時間」這筆真實量到的速度，
+        // 並記一次失敗（跟 HTTP 錯誤同一級，success 一次就抵銷），分數就會照實反映。
+        if (!forced) {
+            try {
+                if (oldest.loaded > 0) recordCdnThroughput(host, oldest.loaded, elapsed, latestPlaybackRate, true)
+                recordCdnPenalty(host, false)
+            } catch {}
+        }
+        if (host.endsWith('.akamaized.net')) {
+            addForcedRedirect(host)
+        } else {
+            softBlockCdn(host, 'slow-segment', 60 * 1000)
+            addForcedRedirect(host, 60 * 1000)
+        }
+        try { promoteBestCdnNow() } catch {}
+        const ok = oldest.xhr._forceTimeout ? oldest.xhr._forceTimeout(elapsed) : false
+        recentHedges.push({ at: new Date().toLocaleTimeString(), host: host.split('.')[0], elapsedMs: elapsed,
+            loadedKB: Math.round(oldest.loaded / 1024), totalKB: Math.round(oldest.total / 1024),
+            estRemainingMs: Number.isFinite(remainingMs) ? Math.round(remainingMs) : null,
+            bufferAhead: +bufferAhead.toFixed(1), test: forced, timeoutSet: ok })
+        if (recentHedges.length > 10) recentHedges.shift()
+        log('[慢片段] ' + host.split('.')[0] + ' 上的片段 ' + (elapsed / 1000).toFixed(1) + ' 秒只下載 '
+            + Math.round(oldest.loaded / 1024) + '/' + Math.round(oldest.total / 1024) + 'KB、緩衝剩 '
+            + bufferAhead.toFixed(1) + ' 秒 → 讓它逾時，由播放器重試到其他節點' + (forced ? '（測試）' : ''))
+    }
     const BLOCKING_MIN_AGE_MS = 1500
     const getBlockingHost = () => {
         const now = Date.now()
@@ -4665,7 +4547,7 @@ const Watchdog = (() => {
             const dur = (entry.responseEnd && entry.responseStart)
                 ? (entry.responseEnd - entry.responseStart)
                 : (entry.duration || 0)
-            recordCdnThroughput(h, bytes, dur, rate)
+            notePassiveThroughput(h, bytes, dur, rate)
         } catch {}
     }
 
@@ -4707,6 +4589,13 @@ const Watchdog = (() => {
             + ((currentStreamBitsPerSec / 1e6 >= 12) ? STARTUP_GRACE_MS_HIGH : STARTUP_GRACE_MS)
     }
 
+    const notePenalty = (reason, target) => {
+        recentPenalties.push(Object.assign({ at: new Date().toLocaleTimeString(), reason, target: String(target).split('.')[0],
+            blocker: getBlockingHost() ? getBlockingHost().split('.')[0] : null }, lastStallContext || {}))
+        if (recentPenalties.length > 10) recentPenalties.shift()
+        lastStallContext = null
+    }
+
     const switchCdn = (reason) => {
         if (inSeekGrace()) return
         const nowSw = Date.now()
@@ -4745,7 +4634,7 @@ const Watchdog = (() => {
         if (blocker && blocker.endsWith('.akamaized.net')) {
             addForcedRedirect(blocker)
             promoteBestCdnNow()
-            syncWorkerCdnTarget()
+            notePenalty(reason, blocker + '（改寫）')
             log('[Watchdog] 切換觸發：' + reason + '，卡住的是 Akamai 上的片段，改寫到白名單節點（10 分鐘後再試 Akamai）')
             return
         }
@@ -4775,7 +4664,9 @@ const Watchdog = (() => {
             recordCdnPenalty(culprit, false)
             softBlockCdn(culprit, reason, CDN_SOFT_BLOCK_MS)
             burstPunished.push(culprit)   // 斷路器跳脫時要能把這一波的懲罰收回去
-            log('[Watchdog] 切換觸發：' + reason + '，懲罰 ' + culprit.split('.')[0])
+            notePenalty(reason, culprit)
+            log('[Watchdog] 切換觸發：' + reason + '，懲罰 ' + culprit.split('.')[0]
+                + (lastStallContext ? '｜' + JSON.stringify(lastStallContext) : ''))
         }
 
         try { GM_deleteValue(PROBE_CACHE_KEY) } catch {}
@@ -4834,6 +4725,7 @@ const Watchdog = (() => {
             lastCurrentTime = v.currentTime
             lastBufferedEnd = bufferedEnd(v)
             stallCount      = 0
+            stallSkipReason = '分頁剛從背景回來（取樣失真）'
             return
         }
 
@@ -4891,6 +4783,7 @@ const Watchdog = (() => {
             lastNudgeDetectAt = Date.now()
             stallCount = 0
             lastBufferedEnd = be
+            stallSkipReason = '播放器自救跳轉'
             return
         }
         // seek 到未載入區段時，播放器通常會 abort 舊請求並重建新 segment；
@@ -4898,25 +4791,23 @@ const Watchdog = (() => {
         if (inSeekGrace()) {
             stallCount = 0
             lastBufferedEnd = be
+            stallSkipReason = '保護期（拖時間軸／切畫質／播放器清緩衝）'
             return
         }
         // 自救後短時間內不重複判定卡頓
         if (Date.now() - lastNudgeDetectAt < 3000) {
             stallCount = 0
             lastBufferedEnd = be
+            stallSkipReason = '播放器自救後 3 秒'
             return
         }
 
         // buffered.end 在超前緩衝充足時播放中常不變（僅 start 前移），勿當停滯
         const bufferAhead = Math.max(0, be - ct)
-        const playing = !v.paused && !v.seeking && v.readyState >= 2
+        maybeHedgeSlowSegment(bufferAhead, v.paused)
 
         // 高碼率（4K / 高 fps）：下載速度只要低於即時碼率，緩衝就會慢慢被吃完最後卡住。
         // 對 4K 更快反應（stallMaxEff 較小）、達標後也更早恢復監看（recheckEff 較大）。
-        // 註：這裡原本還有一個 minAheadEff（高碼率 30 秒），它是「希望存這麼多緩衝」的
-        // 目標線，卻被拿來當「該不該換節點」的觸發條件 —— 那正是「一直換節點」的根因
-        //（見 STALL_DANGER_SEC 的完整說明）。觸發條件改用危險線之後它就沒有讀者了，
-        // 一併刪除，不留下「看起來還有作用其實沒有」的變數。
         const streamMbps  = currentStreamBitsPerSec / 1e6
         const highBitrate = streamMbps >= 12
         const recheckEff  = highBitrate ? 20 : REACHED_RECHECK_BUFFER_SEC
@@ -4928,6 +4819,7 @@ const Watchdog = (() => {
         if (Date.now() - startedAt < graceMs || Date.now() < switchGraceUntil) {
             stallCount = 0
             lastBufferedEnd = be
+            stallSkipReason = Date.now() < switchGraceUntil ? '剛換節點（連線暖機）' : '剛開播（連線暖機）'
             return
         }
 
@@ -4935,66 +4827,53 @@ const Watchdog = (() => {
         // 剩餘播放時間越來越少、bufferAhead 也越來越低——「進危險區、終點不動、正在播、存量減少」四個條件
         // 全部成立，舊版會在每支播到結尾的片（含自動連播）把正在用的節點判成「buffered 停滯」並軟隔離。
         // 2026-10-25 實機：一支片播完自動跳下一支後，表現最好的 aliov 就這樣被隔離（lastSoftBlockReason = buffered 停滯）。
-        const fullyBuffered = Number.isFinite(v.duration) && v.duration > 0 && be >= v.duration - 0.5
+        // v1.4.0：容許 0.5 → 1.5 秒。B 站播放器在快結束前（實測約剩 5.5 秒）才呼叫 endOfStream，在那之前 video.duration
+        // 是播放資訊裡四捨五入的整數秒（2954），全部下載完的 buffered.end 卻是 2953.0——差 1 秒，舊的 0.5 秒例外不成立。
+        // 2026-10-25 實機重現（1080P+，影子監視器每秒套用 v1.3.7 的預測型規則）：結束前 9.7～5.5 秒連續判定「停滯」，
+        // 正是長時間測試裡 aliov 在片尾前 8 秒被罰的原因。v1.4.0 的懲罰已改為「真的卡住」（這段期間 readyState 一直是 4），
+        // 這條例外只剩安全網與面板顯示的作用。
+        const fullyBuffered = Number.isFinite(v.duration) && v.duration > 0 && be >= v.duration - 1.5
         if (fullyBuffered) {
             stallCount = 0
             lastBufferedEnd = be
+            stallSkipReason = '已緩衝到片尾'
             return
         }
 
-        // 只有進了危險線才考慮換節點（見 STALL_DANGER_SEC 的說明）。
-        // 註：原本這裡還有一個 needMoreBuffer = bufferAhead < minAheadEff，它是舊的觸發條件。
-        // 「要不要繼續積極監看」其實是由下面的 monitorAfterReached 在管，跟它無關，
-        // 所以連同 minAheadEff 一起刪掉，不留下「看起來還有作用其實沒有」的變數。
-        const inDanger = bufferAhead < STALL_DANGER_SEC
-        const urgentBuffer = bufferAhead < URGENT_BUFFER_SEC
         const monitorAfterReached = reached && bufferAhead < recheckEff
         if (reached && !monitorAfterReached) {
             stallCount = 0
             lastBufferedEnd = be
+            stallSkipReason = '緩衝充足'
             return
         }
-        // 4K：門檻 = 即時碼率本身（下載低於它必定耗盡緩衝）；其他畫質沿用較寬鬆的需求值
+        stallSkipReason = null
         const requiredBps = highBitrate
             ? streamMbps * 1e6 / 8
             : getRequiredStreamMbps(v.playbackRate, 'steady') * 1e6 / 8
         // v1.3.3：MIN_BPS_FLOOR 這個絕對下限，本來只是為了「碼率未知時不要訂出荒謬的
-        // 低門檻」。但碼率已經知道、而且很低時（480p 只需要約 0.11 MB/s），
-        // 350 KB/s 的下限反而變成一個跟這支片無關的高門檻 —— 播放器穩態根本不會拉到
-        // 那麼快，於是低碼率影片被永久誤判成「太慢」。下限不該超過實際需求的 1.2 倍。
+        // 低門檻」。下限不該超過實際需求的 1.2 倍（低碼率影片才不會被永久誤判成「太慢」）。
         const effFloor = requiredBps > 0 ? Math.min(MIN_BPS_FLOOR, requiredBps * 1.2) : MIN_BPS_FLOOR
         const minBps = Math.max(effFloor, requiredBps)
-        // v1.3.3：緩衝存量的趨勢才是「跟不跟得上」的物理事實。
-        // 只看 bps 對不對得上估算門檻，會有一整類系統性誤判：播放器在穩態下只會拉
-        // 「剛好等於碼率」的量（它本來就不該把頻寬吃滿），而門檻是碼率 ×1.05 —— 
-        // 於是只要緩衝低於 minAheadEff，bps 就結構性地永遠略低於門檻，判定必然成立。
-        // 但如果緩衝存量並沒有在減少，那就代表下載其實跟得上，不管估算門檻怎麼說。
-        // 例外：緩衝已經進入危險區（urgentBuffer）時不套用這個條件 —— 那時候就算
-        // 打平也只差一次抖動就斷了，該換還是要換。
-        const oldestAhead = oldestSample.ahead
-        const bufferDraining = typeof oldestAhead === 'number'
-            ? (bufferAhead < oldestAhead - 0.5)
-            : true
-        // stalled（buffered.end 不再前進）有完全一樣的結構性誤判：播放器抓完一段就
-        // 閒置到下一段，這段期間 buffered.end 本來就不會動 —— 但播放時間持續前進，
-        // 連續 2~3 個 tick 就達到 stallMax。所以它同樣要用「整個視窗看緩衝有沒有真的
-        // 在流失」來把關，而不是用 tick 對 tick 的瞬間值。
-        const stalled = inDanger
-            && (be <= lastBufferedEnd + 0.05)
-            && playing
-            && (urgentBuffer || bufferDraining)
-        const tooSlow = inDanger
-            && bps < (urgentBuffer ? minBps * 1.2 : minBps)
-            && playing
-            && totalBytes > 0
-            && (urgentBuffer || bufferDraining)
+        // v1.4.0：懲罰節點只看「播放器真的在等資料」——沒有暫停、沒有在拖時間軸、readyState < HAVE_FUTURE_DATA（3）
+        // 而且前方緩衝不到 1 秒，也就是使用者正看著轉圈。舊版是預測型：緩衝低於 10 秒、終點不動、存量在減少就判定，
+        // 播放器根本還沒卡也會懲罰節點——片尾、切畫質、清緩衝、段間空檔都是這樣誤判的，於是一路長出一堆例外；
+        // 2026-10-25 長時間測試裡 aliov 在片尾前 8 秒（播放完全順暢）被罰，也是這條預測型判定。
+        // 「快卡住了」的預測改交給慢片段補發（maybeHedgeSlowSegment）：它只讓慢的請求改走別處，不扣分。
+        const starving = !v.paused && !v.seeking && v.readyState < 3 && bufferAhead < 1
+        const stalled = starving && (be <= lastBufferedEnd + 0.05)
+        const tooSlow = starving && totalBytes > 0 && bps < minBps
         lastBufferedEnd = be
 
         if (stalled || tooSlow) {
-            stallCount += urgentBuffer ? 2 : 1
+            stallCount += 1
             if (stallCount >= stallMaxEff) {
                 stallCount = 0
                 sessionStallCount++
+                const inf = inflightSegs.size
+                lastStallContext = { ct: +ct.toFixed(1), duration: Number.isFinite(v.duration) ? +v.duration.toFixed(2) : null,
+                    bufferedEnd: +be.toFixed(2), ahead: +bufferAhead.toFixed(1), readyState: v.readyState,
+                    kbps: Math.round(bps * 8 / 1000), inflight: inf, quality: currentStreamBitsPerSec ? +(currentStreamBitsPerSec / 1e6).toFixed(1) : 0 }
                 switchCdn(stalled ? 'buffered 停滯' : 'bps=' + Math.round(bps / 1024) + 'KB/s 低於需求')
             }
         } else {
@@ -5003,17 +4882,32 @@ const Watchdog = (() => {
     }
 
     return {
-        // 由 Worker 透過 MessagePort 回報的 segment 下載量（主執行緒 PerformanceObserver 看不到 Worker 流量）。
-        // 無 duration 故不更新單節點吞吐 EWMA，但計入總量讓面板 MB 正確、Watchdog 的 bps 判斷不再對 4K 半盲。
-        noteSegmentStart(host) {
+        noteSegmentStart(host, xhr) {
             if (!host) return 0
             const token = ++inflightSeq
-            inflightSegs.set(token, { host, t: Date.now() })
+            inflightSegs.set(token, { host, t: Date.now(), xhr: xhr || null, loaded: 0, total: 0 })
             // 防呆：正常一定會收到結束通知；萬一沒有（例外路徑），不讓舊紀錄永遠佔著「最久」
             if (inflightSegs.size > 64) inflightSegs.delete(inflightSegs.keys().next().value)
             return token
         },
         noteSegmentEnd(token) { if (token) inflightSegs.delete(token) },
+        noteSegmentProgress(token, loaded, total) {
+            const e = token && inflightSegs.get(token)
+            if (e) { e.loaded = loaded; if (total) e.total = total }
+        },
+        recentHedges: () => recentHedges.slice(),
+        // 測試模式：Watchdog 每秒才 tick 一次，快的節點片段幾百毫秒就下載完，很難剛好碰上；改成每 50ms 檢查、最多 30 秒
+        hedgeTestOnce() {
+            hedgeTestArmed = true
+            const until = Date.now() + 30000
+            const iv = setInterval(() => {
+                if (!hedgeTestArmed || Date.now() > until) { clearInterval(iv); hedgeTestArmed = false; return }
+                const v = getVideo()
+                if (!v) return
+                const be = bufferedEnd(v)
+                maybeHedgeSlowSegment(Math.max(0, be - v.currentTime), v.paused)
+            }, 50)
+        },
         getBlockingHost,
         // 診斷用：下載中的片段數，與等最久的那一個（host、已等幾秒）
         inflightSummary() {
@@ -5023,6 +4917,8 @@ const Watchdog = (() => {
                 oldestHost: oldest ? oldest.host : null,
                 oldestSec: oldest ? +((Date.now() - oldest.t) / 1000).toFixed(1) : 0 }
         },
+        // XHR progress／fetch 逐 chunk 即時回報的下載量（不經 PerformanceObserver）。
+        // 無 duration 故不更新單節點吞吐 EWMA，但計入總量讓面板 MB 正確、Watchdog 的 bps 判斷即時。
         noteExternalBytes(host, bytes) {
             if (!bytes || bytes <= 0) return
             totalBytes += bytes
@@ -5075,6 +4971,9 @@ const Watchdog = (() => {
             const targetBytes = getBufferTargetBytes(v && v.playbackRate)
             return {
                 // 這一段（換片或切畫質後）的進度：面板顯示這組。不鎖存，目標變大時會如實變回「未達標」。
+                recentPenalties: recentPenalties.slice(),
+                stallCheck: stallSkipReason || '判定中（真的卡住才懲罰）',
+                recentHedges: recentHedges.slice(),
                 phaseMB:       +fmtMB(phaseBytes),
                 phaseReached:  phaseBytes >= targetBytes,
                 phaseReason,
@@ -5134,7 +5033,6 @@ const getPageTypeLabel = () => {
 // 來回追問版本/狀態的往返。刻意只放 host 與統計數字——不含完整影片網址、cookie、
 // IP 等任何可識別使用者身分或觀看紀錄的資訊。
 const buildDiagReport = () => {
-    const ws = summarizeWorkerStats()
     const httpDns = getHttpDnsStatus()
     const lines = [
         '[BiliCDN_TW 診斷報告]',
@@ -5143,7 +5041,6 @@ const buildDiagReport = () => {
         'UA：' + navigator.userAgent,
         '面板注入狀態：' + uiInjectStatus,
         '停用狀態：' + disabled,
-        'Worker 攔截開關：' + EnableWorkerIntercept,
         '白名單：' + (activeCdnList.map(c => c.split('.')[0]).join(' > ') || '（無）'),
         '黑名單（24h）：' + ([...blacklistSet].map(c => c.split('.')[0]).join(', ') || '（無）'),
         '持久死節點：' + (listDeadHosts()
@@ -5153,8 +5050,6 @@ const buildDiagReport = () => {
         '頁面發現 CDN：' + (pageDiscoveredCdn ? pageDiscoveredCdn.split('.')[0] : '（無）'),
         '改寫統計：' + JSON.stringify(redirectStats),
         'HTTPDNS：' + httpDns.mode + (httpDns.ttlMin ? '（' + httpDns.ttlMin + 'm）' : ''),
-        'Worker 量測：created=' + ws.created + ' netCalls=' + ws.netCalls + ' mediaSeen=' + ws.mediaSeen
-            + ' rewrites=' + ws.rewrites + ' 觀察' + ws.observedDays + '天 判讀=' + ws.verdict,
     ]
     return lines.join('\n')
 }
@@ -5198,6 +5093,7 @@ unsafeWindow.BiliCDN = {
             PREFERRED_CDN_LIST.filter(isPresumedBadHost).map(c => c.split('.')[0]))
         console.log('失敗計數:', cdnFailCount)
         console.log('連不上時的對照組（判斷是不是本機斷線）:', pickControlHost(null))
+        console.log('起播賽跑（最近 10 次）:', StartupRace.history())
         console.log('最低需求 Mbps:', +getRequiredStreamMbps().toFixed(2))
         console.log('CDN 吞吐評分:', Object.fromEntries(
             Object.entries(cdnHealth).map(([k, h]) => [k.split('.')[0], {
@@ -5223,7 +5119,6 @@ unsafeWindow.BiliCDN = {
         console.log('HTTPDNS:', getHttpDnsStatus())
         console.log('WebRTC 阻擋:', BlockWebRTC)
         console.log('改寫統計:', { ...redirectStats })
-        console.log('Worker 攔截量測:', summarizeWorkerStats())
         console.groupEnd()
         return {
             active:  [...activeCdnList],
@@ -5234,6 +5129,7 @@ unsafeWindow.BiliCDN = {
             // 不會進 backup_url、不會被賽馬碰到，但也還沒被判死刑。
             presumed: PREFERRED_CDN_LIST.filter(isPresumedBadHost),
             control: pickControlHost(null),
+            startupRace: StartupRace.history(),
             fail:    { ...cdnFailCount },
             health:  Object.fromEntries(
                 Object.entries(cdnHealth).map(([k, h]) => [k, { ...h, score: getCdnHealthScore(k) }])
@@ -5243,24 +5139,7 @@ unsafeWindow.BiliCDN = {
             discovered: pageDiscoveredCdn,
             httpdns: getHttpDnsStatus(),
             uiInjectStatus,
-            workerStats: summarizeWorkerStats(),
         }
-    },
-    // Worker 攔截有效性量測（改進工單 B）：用真實數據決定 setupClassicWorkerIntercept()
-    // 這 250 行的去留。所有數字只存在本機，回報請直接複製本方法輸出貼給開發者。
-    workerStats() {
-        const s = summarizeWorkerStats()
-        console.group('[BiliCDN] Worker 攔截量測')
-        console.log('created（攔到幾次 new Worker）:', s.created)
-        console.log('netCalls（Worker 內發出幾次網路請求）:', s.netCalls)
-        console.log('mediaSeen（其中幾次是影片分段）:', s.mediaSeen)
-        console.log('rewrites（實際改寫幾次）:', s.rewrites)
-        console.log('累計位元組:', s.bytesMB + ' MB')
-        console.log('已觀察天數:', s.observedDays)
-        console.log('worker script 網址樣本:', s.samples)
-        console.log('判讀:', s.verdict)
-        console.groupEnd()
-        return s
     },
     // 診斷報告一鍵複製（改進工單 F）：回報問題時直接貼給開發者，省掉來回追問。
     // 不含完整影片網址／cookie／IP，只有 host 與統計數字。
@@ -5458,12 +5337,21 @@ unsafeWindow.BiliCDN = {
             ? '| 等最久：' + inf.oldestHost.split('.')[0] + '（' + inf.oldestSec + 's）'
               + (Watchdog.getBlockingHost() ? '，卡住時會被當成元兇' : '') : '')
         s.inflight = inf
+        console.log('卡住判定:', s.stallCheck)
+        if (s.recentPenalties.length) console.log('最近的停滯懲罰（含判定當下的情境）:', s.recentPenalties)
+        if (s.recentHedges.length) console.log('最近的慢片段補發:', s.recentHedges)
         console.log('換節點次數:', s.switchCount, '| 卡頓判定次數:', s.stallCount,
             '| 換節點斷路器:', s.breakerSec > 0
                 ? ('已跳脫，' + s.breakerSec + 's 後恢復（換也沒用，瓶頸在頻寬/碼率/跨境線路）')
                 : '未跳脫')
         console.groupEnd()
         return s
+    },
+    // v1.4.0：驗證「慢片段補發」用。接下來 30 秒內，把第一個下載超過 0.15 秒的片段當成慢片段處理一次
+    // （讓它逾時、由播放器重試到其他節點）。結果看 BiliCDN.buf() 的「最近的慢片段補發」。
+    hedgeTest() {
+        Watchdog.hedgeTestOnce()
+        console.log('[BiliCDN] 接下來 30 秒內，第一個下載超過 0.15 秒的片段會被當成慢片段處理一次，結果看 BiliCDN.buf()')
     },
     watchdog: {
         start: () => Watchdog.start(),
@@ -5877,7 +5765,6 @@ if (typeof GM_registerMenuCommand === 'function') {
         if (bakeoffAbortController) { try { bakeoffAbortController.abort() } catch {} ; bakeoffAbortController = null }
         try { Watchdog.reset() } catch {}
         try { HttpDnsAutoPilot.onWatchdogReset() } catch {}
-        syncWorkerCdnTarget()
         if (rearmSeekPrewarm) rearmSeekPrewarm()
         log('[SPA] 換片：' + key + '，重置選節點狀態')
     }
@@ -6005,7 +5892,6 @@ if (typeof GM_registerMenuCommand === 'function') {
             GM_setValue('disabled', disabled)
             if (disabled) stopRuntimeFeatures()
             else startRuntimeFeatures()
-            syncWorkerDisabledState()
             updateStatusPanel()
         })
 

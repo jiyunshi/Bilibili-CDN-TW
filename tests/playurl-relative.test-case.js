@@ -49,6 +49,19 @@ FakeXHR.DONE = 4
     ok((rel.flac.audio.backup_url || []).length > 1, 'Hi-Res 無損音軌的備用線路也補上白名單節點')
     ok(JSON.stringify(rel) === JSON.stringify(abs), '兩種寫法改寫結果相同')
 
+    // ── v1.4.0：番劇換集用 /ogv/player/playview（fetch、`//` 開頭），播放資訊在 data.video_info.dash ──
+    const OGV = JSON.stringify({ code: 0, data: { video_info: JSON.parse(RAW).data } })
+    ctx.__fetchImpl = () => Promise.resolve({ status: 200, statusText: 'OK', headers: {}, ok: true, text: () => Promise.resolve(OGV) })
+    const ogv = JSON.parse(await (await ctx.fetch('//api.bilibili.com/ogv/player/playview?ep_id=679960&qn=120&fnval=4048')).text()).data.video_info.dash
+    console.log('  番劇換集：4K 主線路 ' + host(ogv.video[0].base_url).split('.')[0] + '，1080P 主線路 ' + host(ogv.video[1].base_url).split('.')[0])
+    ok(host(ogv.video[0].base_url) !== AKAM && host(ogv.video[0].base_url) !== COSOV, '番劇換集（ogv/player/playview）的播放資訊也會被改寫')
+    ok((ogv.audio[0].backup_url || []).length > 1, '番劇換集的音軌也補上白名單備用線路')
+    // ── v1.4.0：番劇正片前的播放檢查 /ogv/player/pre/check/drm（XHR，同樣是 data.video_info.dash）──
+    ctx.__fetchImpl = () => Promise.resolve({ status: 200, statusText: 'OK', headers: {}, ok: true, text: () => Promise.resolve(OGV) })
+    const pre = JSON.parse(await (await ctx.fetch('//api.bilibili.com/ogv/player/pre/check/drm?drm_tech_type=2')).text()).data.video_info.dash
+    ok(host(pre.video[0].base_url) !== AKAM && host(pre.video[0].base_url) !== COSOV, '番劇播放前檢查（ogv/player/pre/check/drm）帶回的片頭播放資訊也會被改寫')
+    ctx.__fetchImpl = fetchImpl
+
     // ── fetch 路徑（播放器目前用 XHR，但這條路徑也要一致）──
     const viaFetch = JSON.parse(await (await ctx.fetch('//api.bilibili.com/x/player/wbi/playurl?bvid=BV1&cid=1&qn=120')).text()).data.dash
     ok(host(viaFetch.video[0].base_url) !== AKAM && host(viaFetch.video[0].base_url) !== COSOV, 'fetch 省略協定的 playurl 也會被改寫')

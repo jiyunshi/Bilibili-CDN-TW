@@ -40,6 +40,15 @@ module.exports = (file, mode, opts) => {
         addEventListener(){}, removeEventListener(){}, dispatchEvent(){},
     }
     ctx.window = ctx; ctx.unsafeWindow = ctx; ctx.globalThis = ctx; ctx.self = ctx
+    // 可選：假時鐘（opts.clock 回傳毫秒）。模擬器用它讓結果可重現，並讓「模擬時間」真的流逝（半衰期才有作用）。
+    if (opts && typeof opts.clock === 'function') {
+        const RealDate = Date, clock = opts.clock
+        ctx.Date = class FakeDate extends RealDate {
+            constructor(...a) { if (a.length) super(...a); else super(clock()) }
+            static now() { return clock() }
+        }
+        ctx.performance = Object.assign({}, ctx.performance, { now: () => clock() })
+    }
     vm.createContext(ctx)
     // 測試端可在載入前設定 ctx.__fetchImpl 模擬 CDN 回應（rawFetch 綁的是載入當下的 fetch）
     ctx.fetch = (...a) => (ctx.__fetchImpl ? ctx.__fetchImpl(...a) : new Promise(() => {}))

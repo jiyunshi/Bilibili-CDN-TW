@@ -2044,13 +2044,23 @@ const buildBackupUrls = (biliSrcUrl) => {
     // v1.4.0：第一個 backup 一定來自不同機房。只取「分數前兩名」的話，香港三台（同在 Equinix HK、
     // 103.151.151.x）分數都高，主線路香港 05 時 backup 就是香港 03、香港 01——那個機房或那條線路出事，
     // 三條網址會一起失效，播放器的 backup 重試等於沒有。不同機房的優先，其餘照分數。
+    // v1.4.1：「不同機房優先」只給已實測過的節點（cands 已濾掉量過但不夠快的）。v1.4.0 不看有沒有證據，
+    // 使用者回報的狀態重播：主線路香港 05 時，第一個白名單 backup 變成從沒量過、延遲 636ms 的 cos，
+    // 實測 42 Mbps 的香港 03 排到它後面。單一節點出事遠比整個機房出事常見，所以不同機房的節點都沒證據時
+    // 照分數排，但仍保證兩個 backup 裡至少一個來自不同機房（同機房一起出事時還有退路）。
     const primaryGroup = cdnSiteGroup(primaryHost)
+    const isDiverse = cdn => cdnSiteGroup(cdn) !== primaryGroup
+    const proven = cdn => { const h = cdnHealth[cdn]; return !!(h && h.samples > 0) }
     const picked = []
-    const diverse = cands.find(cdn => cdnSiteGroup(cdn) !== primaryGroup)
-    if (diverse) picked.push(diverse)
+    const provenDiverse = cands.find(cdn => isDiverse(cdn) && proven(cdn))
+    if (provenDiverse) picked.push(provenDiverse)
     for (const cdn of cands) {
         if (picked.length >= 2) break
         if (!picked.includes(cdn)) picked.push(cdn)
+    }
+    if (!picked.some(isDiverse)) {
+        const anyDiverse = cands.find(isDiverse)
+        if (anyDiverse) picked[picked.length >= 2 ? 1 : picked.length] = anyDiverse
     }
     return picked.map(cdn => replaceUrlHost(biliSrcUrl, cdn)).filter(Boolean)
 }
@@ -5070,13 +5080,16 @@ const buildDiagReport = () => {
             '各節點下載量（MB）：' + JSON.stringify(s.perCdnMB),
         ]
     })
-    section('各節點實測（速度 Mbps／延遲 ms／樣本數／失敗次數／分數，依分數排序）', () => {
+    // 分數用起播模式（不含探索加分）：起播與 backup 實際用的就是這個。含探索加分的分數會讓「從沒量過」的節點
+    // 排得比實測 145 Mbps 的節點還前面（v1.4.1 第一份實機報告），讀報告的人會誤會。
+    section('各節點實測（速度 Mbps／延遲 ms／樣本數／失敗次數／分數，依分數排序；分數不含探索加分）', () => {
         const rows = Object.entries(cdnHealth)
-            .map(([k, h]) => ({ k, h, score: getCdnHealthScore(k) }))
+            .map(([k, h]) => ({ k, h, score: getCdnHealthScore(k, STARTUP_PICK) }))
             .sort((a, b) => b.score - a.score)
             .map(({ k, h, score }) => short(k) + '：' + (h.samples ? h.ewmaMbps.toFixed(1) : '—') + ' / '
                 + (h.latencyMs ? Math.round(h.latencyMs) : '—') + ' / ' + (h.samples || 0) + ' / '
                 + (h.failures || 0) + ' / ' + score.toFixed(2)
+                + (isPresumedBadHost(k) ? '（推定在台灣不可用，不使用）' : '')
                 + (isCdnSoftBlocked(k) ? '（暫時避開）' : '') + (isCdnStronglyBad(k) ? '（表現差）' : ''))
         return rows.length ? rows : ['（尚無資料）']
     })

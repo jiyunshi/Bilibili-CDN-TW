@@ -8,7 +8,9 @@ const file = (process.argv[2] || require('path').join(__dirname, '..', 'bilibili
 const H = s => 'upos-sz-mirror' + s + '.bilivideo.com'
 
 ;(async () => {
-    const { T } = load(file, 'new', { exports: `globalThis.__T = { score: getCdnHealthScore, setBitrate: setBufferTargetFromBitrate, req: getRequiredStreamMbps,
+    // 固定時鐘：分數會隨「距離上次樣本多久」衰減，下面有 1e-9 精度的比較。用真實時間時，電腦忙碌下
+    // 設定與計算之間跨過 1 毫秒就會偶發失敗（2026-10-25 完整測試跑 20 個檔案時出現過一次）。
+    const { T } = load(file, 'new', { clock: () => 1.75e12, exports: `globalThis.__T = { score: getCdnHealthScore, setBitrate: setBufferTargetFromBitrate, req: getRequiredStreamMbps,
         set: (cdn, o) => { const h = ensureCdnHealth(cdn); Object.assign(h, { ewmaMbps: 0, varMbps: 0, samples: 0, failures: 0, slowSamples: 0, latencyMs: 0, lastSeen: Date.now() }, o) },
         reset: () => { for (const k in cdnHealth) delete cdnHealth[k]; for (const k in cdnFailCount) delete cdnFailCount[k] } }` })
     await sleep(300)

@@ -6,7 +6,7 @@ let pass = 0, fail = 0
 const ok = (c, m) => { c ? pass++ : fail++; console.log((c ? 'PASS ' : 'FAIL ') + m) }
 const file = (process.argv[2] || require('path').join(__dirname, '..', 'bilibili-cdn-tw.user.js')), mode = process.argv[3] || 'new'
 const HK = ['cn-hk-eq-01-05.bilivideo.com', 'cn-hk-eq-01-03.bilivideo.com', 'cn-hk-eq-01-01.bilivideo.com']
-const ALIOV = 'upos-sz-mirroraliov.bilivideo.com', BOS = 'upos-sz-mirrorbos.bilivideo.com'
+const ALIOV = 'upos-sz-mirroraliov.bilivideo.com', BOS = 'upos-sz-mirrorbos.bilivideo.com', COS = 'upos-sz-mirrorcos.bilivideo.com'
 const SIG = '/upgcxcode/1/2/3/3-1-100026.m4s?e=x&deadline=9999999999&upsig=abc'
 const host = u => new URL(u).hostname
 const isHK = h => /^cn-hk-/.test(h)
@@ -15,6 +15,7 @@ const isHK = h => /^cn-hk-/.test(h)
     const { T } = load(file, mode, { exports: `globalThis.__T = { transform: transformStreamItem, normalize: normalizeMediaUrl,
         best: () => getCurrentCdn(STARTUP_PICK), soft: (h, ms) => softBlockCdn(h, 'test', ms), dead: h => markHostDead(h, 'timeout'),
         reset: () => { for (const k in cdnHealth) delete cdnHealth[k]; for (const k in cdnSoftBlockUntil) delete cdnSoftBlockUntil[k]; knownDeadHosts.clear(); lastChosenCdn = null },
+        zero: h => Object.assign(ensureCdnHealth(h), { ewmaMbps: 0, samples: 0, successes: 0 }),
         seed: (h, mbps, lat) => Object.assign(ensureCdnHealth(h), { ewmaMbps: mbps, samples: 8, latencyMs: lat, lastSeen: Date.now(), successes: 8 }) }` })
     await sleep(300)
     const seedAll = () => {
@@ -47,6 +48,17 @@ const isHK = h => /^cn-hk-/.test(h)
         // ── 3. 播放器手上還拿著舊的香港網址 → 送出時被改寫走 ──
         const n = T.normalize('https://' + HK[0] + SIG)
         ok(n.changed && !isHK(host(n.url)), '已經拿到的香港網址，請求送出時也被改寫到其他節點')
+
+        // ── 3b. v1.4.1：不同機房的節點都沒量過 → 實測可靠的同機房節點排前面，沒量過的不同機房節點仍保留當退路 ──
+        //    （使用者回報的狀態：香港 05／03 有實測，cos 從沒量過、延遲 636ms；v1.4.0 會讓 cos 排第一個白名單 backup）
+        T.reset()
+        T.seed(HK[0], 145, 92); T.seed(HK[1], 42, 62)
+        T.seed(COS, 0, 636); T.zero(COS)
+        it = item(); T.transform(it, true)
+        const wl3 = it.backup_url.map(host).filter(h => !h.endsWith('.akamaized.net'))
+        console.log('  不同機房都沒量過：主線路 ' + host(it.base_url).split('.')[0] + '，backup ' + it.backup_url.map(u => host(u).split('.')[0]).join('、'))
+        ok(isHK(wl3[0]) && wl3[0] !== host(it.base_url), '不同機房的節點都沒量過 → 第一個白名單 backup 是另一台實測可靠的香港節點（v1.4.0 會是沒量過的 cos）')
+        ok(wl3.some(h => !isHK(h)), '仍保留一個不同機房的 backup（同機房一起出事時的退路）')
 
         // ── 4. 標死（連不上）同樣成立 ──
         seedAll()

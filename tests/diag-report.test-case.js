@@ -29,6 +29,9 @@ const HK5 = 'cn-hk-eq-01-05.bilivideo.com', ALIOV = 'upos-sz-mirroraliov.bilivid
         '包含停滯懲罰、慢片段補發、起播賽跑、測速四段')
     ok(!/https?:|\/\/[a-z0-9.-]+\/|upsig|deadline=|hdnts|bilivideo\.com|akamaized/.test(text), '不含網址、簽名參數或完整主機名稱')
     ok(!/讀取失敗/.test(text), '每一段都讀取成功')
+    const presumedRow = text.split('\n').find(l => l.startsWith('upos-sz-mirrorhw：')) || ''
+    ok(/推定在台灣不可用/.test(presumedRow), '推定不可用的節點有標示（不會被誤讀成最佳選擇）：' + presumedRow)
+    ok(order.indexOf('cn-hk-eq-01-05') < order.indexOf('upos-sz-mirrorhw'), '分數不含探索加分：實測快的節點排在從沒量過的節點前面')
 
     console.log(`\n${pass} passed, ${fail} failed`)
     process.exit(fail ? 1 : 0)

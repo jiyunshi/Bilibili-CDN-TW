@@ -1,6 +1,6 @@
 # Bilibili CDN 台灣優化
 
-[![version](https://img.shields.io/badge/version-1.4.0-3f8fa3?style=flat-square)](./CHANGELOG.md) [![license](https://img.shields.io/badge/license-MIT-4f7d4d?style=flat-square)](./LICENSE) ![runtime](https://img.shields.io/badge/runtime-Tampermonkey-a5701f?style=flat-square) ![dependencies](https://img.shields.io/badge/dependencies-zero-4f7d4d?style=flat-square)
+[![version](https://img.shields.io/badge/version-1.4.1-3f8fa3?style=flat-square)](./CHANGELOG.md) [![license](https://img.shields.io/badge/license-MIT-4f7d4d?style=flat-square)](./LICENSE) ![runtime](https://img.shields.io/badge/runtime-Tampermonkey-a5701f?style=flat-square) ![dependencies](https://img.shields.io/badge/dependencies-zero-4f7d4d?style=flat-square)
 
 **在台灣觀看 Bilibili 時，自動挑選連線較順暢的影片伺服器，減少轉圈與卡頓。**
 
@@ -145,10 +145,11 @@ BiliCDN.reset(); location.reload()
 
 ## 版本沿革
 
-完整的變更內容請參閱 [`CHANGELOG.md`](./CHANGELOG.md)。**目前建議使用 `v1.4.0`。**
+完整的變更內容請參閱 [`CHANGELOG.md`](./CHANGELOG.md)。**目前建議使用 `v1.4.1`。**
 
 | 版本 | 重點 |
 | :--- | :--- |
+| **v1.4.1** | 「複製診斷」的報告補上各伺服器的實測速度與延遲、目前的播放與卡頓判定狀態，以及最近的卡頓判定、慢片段補發、起播賽跑紀錄，回報問題時更容易找出原因。報告同樣不含任何網址或個人資料。 |
 | **v1.4.0** | **從「卡住之後再換」改為「事先避免卡住」。** 影片剛開始播放時，同時向兩台伺服器下載第一段，採用先完成的那一台；某一段下載太慢、來不及在預先下載的影片播完前完成時，提早改由其他伺服器下載；只有在畫面真的卡住時才判定伺服器有問題，不再於影片結尾或切換畫質時誤判。番劇切換集數與片頭、MP4 格式的影片，也改由實測較快的伺服器提供。備用線路改為分散在不同地點，香港的伺服器即使同時故障也有其他線路可用。模擬測試中，4K 每 30 分鐘的卡頓時間由約 1,491 秒降至約 8 秒。另移除一項經長期量測證實沒有作用的功能。 |
 | **v1.3.7** | **修正每個分頁只有第一支影片有被優化的問題**：之後切換影片、播放合集下一集、自動連播、切換 Hi-Res 或杜比音軌時，過去都沒有經過腳本處理。切換畫質或音軌時不再誤判伺服器卡住；切換畫質後會立刻重新計算緩衝並重新測速，設定面板新增「測速」狀態列。卡住時改為處理真正造成卡頓的伺服器。 |
 | **v1.3.6** | 冷門影片的開播時間由約 3～9 秒縮短為約 1 秒：已有測速紀錄時，改由實測夠快的伺服器（多為香港）提供影片；測速紀錄可沿用約一至兩天。測速時完全沒有回應的伺服器改排到最後。 |
@@ -294,7 +295,7 @@ MIT License。本軟體依現況提供，不保證能改善所有網路環境。
 
 ## English
 
-[![version](https://img.shields.io/badge/version-1.4.0-3f8fa3?style=flat-square)](./CHANGELOG.md) [![license](https://img.shields.io/badge/license-MIT-4f7d4d?style=flat-square)](./LICENSE) ![runtime](https://img.shields.io/badge/runtime-Tampermonkey-a5701f?style=flat-square)
+[![version](https://img.shields.io/badge/version-1.4.1-3f8fa3?style=flat-square)](./CHANGELOG.md) [![license](https://img.shields.io/badge/license-MIT-4f7d4d?style=flat-square)](./LICENSE) ![runtime](https://img.shields.io/badge/runtime-Tampermonkey-a5701f?style=flat-square)
 
 **Automatically picks faster video servers when watching Bilibili from Taiwan, so videos spin and stall less.**
 
@@ -366,10 +367,11 @@ Bilibili plays DASH streams: before playback the player fetches "playback info" 
 
 ### Releases
 
-See [`CHANGELOG.md`](./CHANGELOG.md). **`v1.4.0` is the recommended release.**
+See [`CHANGELOG.md`](./CHANGELOG.md). **`v1.4.1` is the recommended release.**
 
 | Version | Highlights |
 | :--- | :--- |
+| **v1.4.1** | The "copy diagnostics" report now includes each server's measured speed and latency, the current playback and stall-check state, and recent stall penalties, slow-segment hedges and startup races, making reported problems much easier to diagnose. It still contains no URLs or personal information. |
 | **v1.4.0** | **Moves from "switch after it stalls" to "avoid the stall in the first place."** When a video starts, the first piece is requested from two servers at once and the faster one wins; a piece downloading too slowly to arrive in time is moved to another server before the picture freezes; and a server is only blamed when playback has genuinely stopped, so the end of a video or a quality change no longer counts as a stall. Bangumi episode changes and pre-rolls, and MP4-format videos, are now served from servers measured to be fast. Backups are spread across different locations, so even a simultaneous failure of all Hong Kong servers leaves another route. In simulation, 4K stalling drops from about 1,491 to about 8 seconds per 30 minutes. A feature that long-term measurement showed never did anything (Worker interception) has been removed. |
 | **v1.3.7** | **Fixes optimization applying only to the first video in each tab**: video switches, the next item in a collection, autoplay, and Hi-Res / Dolby audio toggles previously bypassed the script. Quality or audio-track switches are no longer mistaken for a stalled server; switching resolution immediately recalculates the buffer and re-tests speed. On a stall, the server actually holding up playback is the one penalized. |
 | **v1.3.6** | Unpopular videos start in about 1 second instead of 3–9: once speed data exists, normal-resolution streams are also served from a server measured to be fast enough (usually Hong Kong). Servers that never respond during speed tests are moved to the back of the queue. |

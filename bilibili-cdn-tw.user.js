@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili CDN 台灣優化
 // @namespace    BiliCDN_TW
-// @version      1.4.0
+// @version      1.4.1
 // @description  改善台灣網路觀看 Bilibili 影片時的 CDN 連線穩定度，支援自動切換與卡頓監測
 // @author       jiyunshi <chocosensei214@gmail.com>
 // @license      MIT
@@ -67,7 +67,7 @@ var BlockWebRTC = true
 
 // ── 版本號 ────────────────────────────────────────────────────────────
 // 單一事實來源：優先讀 Tampermonkey 注入的 GM_info（跟著 @version 走，改版不用四處手動同步）。
-const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.0'
+const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.1'
 const parseVer = (v) => String(v || '0').split('.').map(n => parseInt(n, 10) || 0)
 const verGte = (a, b) => {
     const A = parseVer(a), B = parseVer(b)
@@ -5051,6 +5051,44 @@ const buildDiagReport = () => {
         '改寫統計：' + JSON.stringify(redirectStats),
         'HTTPDNS：' + httpDns.mode + (httpDns.ttlMin ? '（' + httpDns.ttlMin + 'm）' : ''),
     ]
+    // v1.4.1：v1.4.0 的診斷資訊（各節點實測、卡住判定、懲罰與補發紀錄、起播賽跑）原本只在 console 的
+    // BiliCDN.diag()／buf() 看得到，「複製診斷」沒有收錄——使用者回報時，最需要的資料反而不在報告裡。
+    // 一樣只放節點名稱與數字，不含網址。任何一段讀取失敗都不影響其他段落。
+    const section = (title, fn) => {
+        lines.push('', '── ' + title + ' ──')
+        try { lines.push(...fn()) } catch (e) { lines.push('（讀取失敗：' + e.message + '）') }
+    }
+    const short = h => String(h || '').split('.')[0]
+    const listOrNone = list => (list && list.length ? list.map(x => JSON.stringify(x)) : ['（無）'])
+    section('播放狀態', () => {
+        const s = Watchdog.stats()
+        return [
+            '畫質：qn ' + (getPlayerQualityQn() || '?') + '，需求 ' + s.requiredMbps + ' Mbps',
+            '播放位置 ' + s.videoTimeSec + ' 秒，緩衝到 ' + s.bufferedSec + ' 秒，readyState ' + s.readyState + (s.paused ? '（暫停中）' : ''),
+            '卡住判定：' + s.stallCheck,
+            '本頁：換節點 ' + s.switchCount + ' 次、停滯判定 ' + s.stallCount + ' 次' + (s.breakerSec ? '、斷路器剩 ' + s.breakerSec + ' 秒' : ''),
+            '各節點下載量（MB）：' + JSON.stringify(s.perCdnMB),
+        ]
+    })
+    section('各節點實測（速度 Mbps／延遲 ms／樣本數／失敗次數／分數，依分數排序）', () => {
+        const rows = Object.entries(cdnHealth)
+            .map(([k, h]) => ({ k, h, score: getCdnHealthScore(k) }))
+            .sort((a, b) => b.score - a.score)
+            .map(({ k, h, score }) => short(k) + '：' + (h.samples ? h.ewmaMbps.toFixed(1) : '—') + ' / '
+                + (h.latencyMs ? Math.round(h.latencyMs) : '—') + ' / ' + (h.samples || 0) + ' / '
+                + (h.failures || 0) + ' / ' + score.toFixed(2)
+                + (isCdnSoftBlocked(k) ? '（暫時避開）' : '') + (isCdnStronglyBad(k) ? '（表現差）' : ''))
+        return rows.length ? rows : ['（尚無資料）']
+    })
+    section('最近的停滯懲罰', () => listOrNone(Watchdog.stats().recentPenalties))
+    section('最近的慢片段補發', () => listOrNone(Watchdog.stats().recentHedges))
+    section('最近的起播賽跑', () => listOrNone(StartupRace.history()))
+    section('測速', () => {
+        const st = lastBakeoffStatus
+        if (!st) return ['（本頁尚未測速）']
+        return [Math.round((Date.now() - st.at) / 1000) + ' 秒前，' + st.outcome + (st.reason ? '（' + st.reason + '）' : '')
+            + '，量了 ' + st.measured + ' 個節點 → ' + (short(st.host) || '—')]
+    })
     return lines.join('\n')
 }
 

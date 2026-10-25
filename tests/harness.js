@@ -27,7 +27,7 @@ module.exports = (file, mode, opts) => {
         console: { log: (...a) => logs.push(a.join(' ')), warn(){}, error(){}, info(){}, debug(){} },
         setTimeout, clearTimeout, setInterval, clearInterval, Promise, URL, URLSearchParams, Map, Set, WeakMap, JSON, Math, Date, AbortController, TextEncoder, TextDecoder,
         GM_getValue: (k, d) => (k in store ? store[k] : d), GM_setValue: (k, v) => { store[k] = v }, GM_deleteValue: k => { delete store[k] }, GM_registerMenuCommand(){},
-        GM_info: { script: { version: 'test' } }, document, Document: Doc, Image: class { set src(v){} }, XMLHttpRequest: XHRStub,
+        GM_info: { script: { version: 'test' } }, document, Document: Doc, Image: class { set src(v){} }, XMLHttpRequest: (opts && opts.XHR) || XHRStub,
         MutationObserver: class { observe(){} disconnect(){} },
         PerformanceObserver: Object.assign(class { observe(){} disconnect(){} }, { supportedEntryTypes: ['resource'] }),
         ProgressEvent: class {},

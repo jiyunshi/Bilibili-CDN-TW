@@ -47,7 +47,9 @@ const exportsCommon = `segErr: handleSegmentConnError, dead: () => [...knownDead
     const env = load(file, 'new', { fetchImpl: fakeFetch, store: { knownDeadHosts_v1: poisoned },
         exports: `globalThis.__T = { ${exportsCommon}, confirm: confirmHostDead, probe: probeCdnLatency,
             reverify: reverifyDeadHosts, pickControl: pickControlHost, active: () => [...activeCdnList],
-            resetSegCooldown: () => segConnCheckAt.clear(), markDead: markHostDead, revive: reviveDeadHost }` })
+            resetSegCooldown: () => segConnCheckAt.clear(), markDead: markHostDead, revive: reviveDeadHost,
+            health: (h, o) => Object.assign(ensureCdnHealth(h), o), clearHealth: () => { for (const k in cdnHealth) delete cdnHealth[k] },
+            setActive: hs => { activeCdnList.length = 0; hs.forEach(h => activeCdnList.push(h)) } }` })
     const { T, logs, store } = env
     await sleep(400)
     T.setVerbose(true)
@@ -59,6 +61,14 @@ const exportsCommon = `segErr: handleSegmentConnError, dead: () => [...knownDead
     down = new Set([H('bos')])
     ok(await T.confirm(H('bos')) === 'dead', '目標不通、對照組通 → dead')
     ok(T.pickControl(H('bos')) !== H('bos'), '對照組不會挑到受測的那顆')
+    // v1.3.7：對照組挑「已知連得快」的，不是清單第一個（實機：挑到冷連線 9 秒的 ali02 → 誤判本機斷線）
+    T.clearHealth(); T.health(H('ali02'), { latencyMs: 8999, probeSlows: 1 }); T.health(H('ali'), { latencyMs: 80, probeTimeouts: 1 })
+    T.health('cn-hk-eq-01-03.bilivideo.com', { latencyMs: 36 }); T.health('cn-hk-eq-01-05.bilivideo.com', { latencyMs: 45 })
+    T.setActive([H('ali02'), H('ali'), 'cn-hk-eq-01-05.bilivideo.com', 'cn-hk-eq-01-03.bilivideo.com'])
+    console.log('  挑到：' + T.pickControl(H('bos')))
+    ok(T.pickControl(H('bos')) === 'cn-hk-eq-01-03.bilivideo.com', '對照組挑延遲最低、沒有逾時／過慢紀錄的節點（跳過清單前面的 ali02、ali）')
+    T.clearHealth()
+    ok(T.pickControl(H('bos')) === 'www.bilibili.com', '沒有任何實測延遲時，用網頁所在的主機當對照組')
     ALL_DOWN = true
     ok(await T.confirm(H('bos')) === 'network-down', '目標與對照組都不通 → network-down（本機斷網）')
     ALL_DOWN = false; down = new Set()

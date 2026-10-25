@@ -10,10 +10,18 @@ const sleep = ms => new Promise(r => setTimeout(r, ms))
     T.sync({ videoHeight: 1080 })
     const startedCooldown = Date.now()
     T.setLastBakeoffAt(startedCooldown)          // 模擬起播賽馬剛跑完、仍在 90 秒冷卻內
-    T.sync({ videoHeight: 2160 }); T.maybe()
-    await sleep(4500)                           // 4K 走 4000ms 延遲
+    T.sync({ videoHeight: 2160 })
+    // 跟實機一樣由 Watchdog 每秒呼叫一次。v1.3.7：切畫質開保護窗（4K 8 秒），過了才排程，再走 4K 的 4000ms 延遲
+    const switchedAt = Date.now()
+    const tick = setInterval(() => T.maybe(), 1000)
+    T.maybe()
+    const early = T.state().lastBk > startedCooldown
+    while (Date.now() - switchedAt < 14000 && !(T.state().lastBk > startedCooldown)) await sleep(250)
+    clearInterval(tick)
     const lastBk = T.state().lastBk
     const ran = lastBk > startedCooldown
-    console.log((ran ? 'PASS' : 'FAIL') + ' 排程觸發後通過冷卻關卡、實際開始賽馬（lastBakeoffAt 已更新）')
-    process.exit(ran ? 0 : 1)
+    const waited = ((lastBk - switchedAt) / 1000).toFixed(1)
+    console.log((!early ? 'PASS' : 'FAIL') + ' 切換當下（保護窗內）不立刻測速')
+    console.log((ran ? 'PASS' : 'FAIL') + ' 保護窗過後排程、通過冷卻關卡、實際開始賽馬（切換後 ' + waited + ' 秒）')
+    process.exit(ran && !early ? 0 : 1)
 })()

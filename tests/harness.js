@@ -58,7 +58,7 @@ module.exports = (file, mode, opts) => {
             setProfile: p => { streamProfile = p }, setSample: u => { lastSampleSegmentUrl = u }, setSeekGrace: t => { seekGraceUntil = t },
             setRunning: b => { bakeoffRunning = b }, clearTimer: () => { clearTimeout(bakeoffTimer); bakeoffTimer = null },
             setLastBakeoffAt, setBitrate: setBufferTargetFromBitrate, setVerbose: b => { Config.verbose = b },
-            state: () => ({ pending: qualityUpPendingBps, base: lastSyncedStreamBps, done: [...qualityUpBakeoffDone], timer: !!bakeoffTimer, cur: currentStreamBitsPerSec, lastBk: getLastBakeoffAt() }) }`
+            state: () => ({ pending: qualityUpPendingBps, base: lastSyncedStreamBps, done: [...qualityUpBakeoffDone], timer: !!bakeoffTimer, cur: currentStreamBitsPerSec, lastBk: getLastBakeoffAt(), force: forceNextBakeoff }) }`
         : `globalThis.__T = { sync: syncStreamBitrateFromVideo, setProfile: p => { streamProfile = p }, setSample: u => { lastSampleSegmentUrl = u },
             clearTimer: () => { clearTimeout(bakeoffTimer); bakeoffTimer = null }, setBitrate: setBufferTargetFromBitrate,
             state: () => ({ timer: !!bakeoffTimer, cur: currentStreamBitsPerSec }) }`

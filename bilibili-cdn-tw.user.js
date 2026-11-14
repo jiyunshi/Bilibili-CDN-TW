@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili CDN 台灣優化
 // @namespace    BiliCDN_TW
-// @version      1.4.1
+// @version      1.4.2
 // @description  改善台灣網路觀看 Bilibili 影片時的 CDN 連線穩定度，支援自動切換與卡頓監測
 // @author       jiyunshi <chocosensei214@gmail.com>
 // @license      MIT
@@ -24,6 +24,9 @@
 // @match        https://www.bilibili.com/movie/*
 // @match        https://www.bilibili.com/anime/*
 // @match        https://www.bilibili.com/match/*
+// @match        https://www.bilibili.com/*/video/*
+// @match        https://www.bilibili.com/*/list/*
+// @match        https://www.bilibili.com/*/watchlater/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
@@ -67,7 +70,7 @@ var BlockWebRTC = true
 
 // ── 版本號 ────────────────────────────────────────────────────────────
 // 單一事實來源：優先讀 Tampermonkey 注入的 GM_info（跟著 @version 走，改版不用四處手動同步）。
-const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.1'
+const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.4.2'
 const parseVer = (v) => String(v || '0').split('.').map(n => parseInt(n, 10) || 0)
 const verGte = (a, b) => {
     const A = parseVer(a), B = parseVer(b)
@@ -1364,7 +1367,7 @@ const wasSegmentAccounted = (url) => {
 // alreadyReportedBytes：send() 裡的 progress 事件已經即時、逐步回報過的量（見下方），
 // 這裡只把「還沒被 progress 算過的尾巴」補給 Watchdog，避免同一個 segment 被算兩次；
 // recordCdnThroughput 仍用完整 bytes + 真正的下載耗時（startedAt→現在）算吞吐分數。
-const noteSegmentBytes = (cdn, xhr, startedAt, url, alreadyReportedBytes) => {
+const noteSegmentBytes = (cdn, xhr, startedAt, url, alreadyReportedBytes, foreign) => {
     if (!cdn) return
     try {
         let bytes = 0
@@ -1383,7 +1386,7 @@ const noteSegmentBytes = (cdn, xhr, startedAt, url, alreadyReportedBytes) => {
         if (!bytes) return
         const durationMs = Math.max(1, Date.now() - startedAt)
         const remaining  = Math.max(0, bytes - (alreadyReportedBytes || 0))
-        if (remaining) Watchdog.noteExternalBytes(cdn, remaining)
+        if (remaining && !foreign) Watchdog.noteExternalBytes(cdn, remaining)   // foreign：別支片（懸停預覽）的片段，見 isForeignSegment
         notePassiveThroughput(cdn, bytes, durationMs, latestPlaybackRate)
         noteSegmentAccounted(url)
     } catch {}
@@ -1515,6 +1518,127 @@ const resetStreamProfile = () => {
     currentStreamBitsPerSec = 0
     baseBufferTargetBytes = DEFAULT_BUFFER_TARGET_BYTES
     seekGraceUntil = 0
+}
+
+// ── 影片身分（v1.4.2）────────────────────────────────────────────────
+// 2026-11-14 實機量到兩件事，讓「網址變了＝換片、playurl 來了＝正在播的片」這兩個假設都不成立：
+//   1. 合集清單／分 P／自動連播換片時，播放器「先」拿到新片的 playurl（約 +100ms 回應），
+//      「之後」才 pushState 改網址（再晚 130～170ms）。舊作法在網址變動時重置，會把剛到手的
+//      新片碼率、測速樣本與測速排程整包清掉——這支片從頭到尾不測速，緩衝門檻用的是預設值。
+//      （點推薦卡片的流程是先 pushState 才發主請求，所以沒事；這也是之前驗證沒抓到的原因。）
+//   2. B 站會預載別支影片的 playurl（gaia_source=pre-load、qn=32）：換片後約 1.5 秒預載下一支，
+//      滑鼠停在推薦卡片上也會（懸停預覽）。舊作法把它當成正在播的片，覆蓋碼率清單與測速樣本。
+// 作法：串流網址本身帶 cid（/upgcxcode/aa/bb/<cid>/…），用「主播放器 playurl 的 cid 換了」當作
+// 換片的依據；網址變動只在 playurl 還沒到時先行重置。兩個訊號互相認領，同一次換片只重置一次。
+let mainStreamCid = ''            // 目前主播放器那支片的 cid（取自 playurl 內容；取不到就維持空字串＝退回只看網址）
+let newVideoResetHook = null      // 重置本體在 Main 區塊裡（要用到那邊的閉包），由它掛進來
+let playurlResetAt = 0            // 最近一次「由 playurl 發現換片」而重置的時間
+let playurlResetUnclaimed = false // 該次重置還沒被接下來的網址變動認領
+let urlResetAt = 0                // 最近一次「由網址變動」而重置的時間
+let urlResetPending = false       // 該次重置還沒等到新片的主 playurl
+let cidBeforeUrlReset = ''        // 網址變動重置時會清空 mainStreamCid，清空前的值留在這裡（分辨之後來的 playurl 是不是同一支片）
+const VIDEO_RESET_PAIR_MS = 5000  // 兩個訊號視為同一次換片的時間窗（實測相差 40～170ms，留足餘裕）
+// 換片判定的統計（BiliCDN.diag() 與診斷報告會印）。orphan = 由 playurl 觸發的重置，事後沒有網址變動來認領。
+// 正常換片一定會改網址，orphan 持續增加代表「預載被當成主請求」（多半是 B 站改了 pre-load 標記）。
+const videoResetStats = { byUrl: 0, byPlayurl: 0, claimed: 0, orphan: 0, preloadSeen: 0, foreignSegs: 0, filterDisarmed: 0 }
+const STREAM_CID_RE = /\/upgcxcode\/\d+\/\d+\/(\d+)\//
+const extractStreamCid = (dash) => {
+    try {
+        for (const it of (dash && dash.video) || []) {
+            for (const u of [it && it.base_url, it && it.baseUrl].concat((it && it.backup_url) || [], (it && it.backupUrl) || [])) {
+                const m = typeof u === 'string' && u.match(STREAM_CID_RE)
+                if (m) return m[1]
+            }
+        }
+    } catch {}
+    return ''
+}
+// 不是主播放器發的 playurl：只改寫網址，不當成正在播的片（見上面第 2 點）。2026-11-14 實機看到三種請求：
+//   主播放器      is_main_page=true 、gaia_source=（空）   、qn=120、有 session
+//   懸停預覽      is_main_page=false、gaia_source=view-card、qn=32
+//   預載下一支    （沒有 is_main_page）、gaia_source=pre-load 、qn=32
+// 判別：明講 is_main_page=true 就是主請求；否則只要 is_main_page 有給（非 true）或 gaia_source 有值就不是。
+// 兩個參數都沒有的（番劇、課程等其他 API）照舊當主請求——認不出來寧可維持舊行為。
+const isPreloadPlayUrl = (url) => {
+    try {
+        const sp = new URL(toAbsoluteUrl(url)).searchParams
+        const main = sp.get('is_main_page')
+        if (main === 'true') return false
+        return main !== null || !!sp.get('gaia_source')
+    } catch { return false }
+}
+// ── 不是主影片的片段不餵給 Watchdog（v1.4.2）─────────────────────────
+// 滑鼠停在推薦卡片上時，預覽播放器會持續抓那支片的 .m4s，跟主影片的片段交錯（2026-11-14 實機）。
+// 這些流量算進 Watchdog 的話：緩衝進度與各節點下載量混進別支片的數字、「下載中的片段」多出不相干的請求、
+// 「目前播放節點」可能被預覽用的節點蓋掉（測速與換節點都拿它當基準）。
+// 只過濾餵給 Watchdog 的部分；節點的成功／失敗／速度統計照舊——那是真實的網路量測，跟哪支片無關。
+// 不知道主影片是誰（mainStreamCid 為空）或網址認不出 cid 時一律不過濾，寧可維持舊行為。
+const segWindow = { main: 0, foreign: 0 }
+const isForeignSegment = (url) => {
+    if (!mainStreamCid) return false
+    const m = typeof url === 'string' && url.match(STREAM_CID_RE)
+    if (!m) return false
+    if (m[1] === mainStreamCid) { segWindow.main++; return false }
+    segWindow.foreign++
+    videoResetStats.foreignSegs++
+    return true
+}
+// 保險：萬一認錯主影片（例如 B 站新增一種腳本不認得的預覽請求），真正在播的片段會全被當成「別支片」，
+// Watchdog 整支片看不到流量。徵兆是「主影片的緩衝一直在長，卻只看到別支片的片段」——連續兩個
+// 檢查週期如此就解除過濾（把 cid 清空，等下一次主 playurl 再重新認）。純懸停預覽不會觸發：
+// 主影片緩衝有在長的時候，一定也看得到主影片自己的片段。
+const FOREIGN_FILTER_CHECK_MS = 5000
+let foreignOnlyStrikes = 0
+let foreignCheckBufEnd = -1
+let foreignFilterWarned = false
+const checkForeignFilterSanity = () => {
+    const f = segWindow.foreign, m = segWindow.main
+    segWindow.foreign = 0; segWindow.main = 0
+    if (!mainStreamCid || !f || m) { foreignOnlyStrikes = 0; foreignCheckBufEnd = -1; return }
+    let end = -1
+    try { const st = Watchdog.stats(); if (st && !st.paused) end = st.bufferedSec } catch {}
+    const grew = foreignCheckBufEnd >= 0 && end > foreignCheckBufEnd + 2
+    foreignCheckBufEnd = end
+    foreignOnlyStrikes = grew ? foreignOnlyStrikes + 1 : 0
+    if (foreignOnlyStrikes < 2) return
+    foreignOnlyStrikes = 0; foreignCheckBufEnd = -1
+    mainStreamCid = ''
+    videoResetStats.filterDisarmed++
+    if (foreignFilterWarned) return
+    foreignFilterWarned = true
+    console.warn('[' + PluginName + ']: 認錯了正在播放的影片（緩衝有在增加，卻沒看到它的片段），已暫停「排除預覽流量」直到下一支影片。'
+        + '影片仍會正常播放；請把 BiliCDN.diag() 的「換片判定」那一行回報給作者。')
+}
+
+// 主播放器的 playurl 抵達時呼叫（在套用新片的碼率／樣本「之前」）。
+const noteMainStream = (cid) => {
+    if (!cid) return
+    const prev = mainStreamCid
+    mainStreamCid = cid
+    if (prev === cid) return                   // 同一支片重打 playurl（切畫質、續期）
+    if (!prev) {
+        // 第一支片，或網址變動那邊已經先重置過（重置時會把 cid 清成空字串，見 onSpaNavigate）。
+        const before = cidBeforeUrlReset
+        cidBeforeUrlReset = ''
+        if (urlResetPending) {
+            // 待認領的旗標要在這裡收掉，否則 5 秒內緊接著的合集換片會被它誤認領、少重置一次。
+            const fresh = Date.now() - urlResetAt < VIDEO_RESET_PAIR_MS
+            urlResetPending = false
+            if (fresh) { videoResetStats.claimed++; return }
+        }
+        // 那次網址變動早就過了認領時間窗（多半是同一支片的網址被改寫），現在才來一個 cid：
+        // 跟清空前一樣＝同一支片重打 playurl；不一樣＝這是 playurl 先到的換片，照下面的路徑重置。
+        if (!before || before === cid) return
+    }
+    if (urlResetPending && Date.now() - urlResetAt < VIDEO_RESET_PAIR_MS) {
+        urlResetPending = false                // 網址變動那邊已經為這支片重置過了
+        videoResetStats.claimed++
+        return
+    }
+    playurlResetAt = Date.now()
+    playurlResetUnclaimed = true
+    videoResetStats.byPlayurl++
+    if (newVideoResetHook) { try { newVideoResetHook('playurl cid ' + cid) } catch {} }
 }
 
 // ── HTTPDNS AutoPilot：短測 10 分鐘 → 評分 → 記憶網路環境（最長 6 小時）────────
@@ -2419,8 +2543,10 @@ const pickBakeoffSampleUrl = (videoList) => {
 }
 
 // 處理整個 playInfo（dash / durl / durls 三種格式）
-const playInfoTransformer = (playInfo) => {
+const playInfoTransformer = (playInfo, opts) => {
     if (!playInfo) return
+    const isPreload = !!(opts && opts.preload)
+    if (isPreload) videoResetStats.preloadSeen++
     if (playInfo.code !== undefined && playInfo.code !== 0) {
         return
     }
@@ -2451,6 +2577,8 @@ const playInfoTransformer = (playInfo) => {
     try {
         const dash = video_info && video_info.dash
         if (dash) {
+            // 一定要在下面套用碼率清單與樣本之前：發現是新片就先重置，才不會清掉新片自己的資料
+            if (!isPreload) noteMainStream(extractStreamCid(dash))
             normalizeDashCodecPreference(dash)
 
             // v1.3.6：不再改寫 minBufferTime / min_buffer_time（之前一般畫質改 3.0、4K 改 1.0），維持 B 站原值。
@@ -2460,7 +2588,8 @@ const playInfoTransformer = (playInfo) => {
             // 舊註解說「4.0 會讓 seek 後多等 ~2s」，以現在的播放器而言沒有程式路徑能造成這個效果。
             // 保留原值的理由：B 站若哪天在點播用到它，原值才是他們預期的。
             // （同樣不能加 maxBufferLength：4K AV1 + FLAC 設大會觸發 SourceBuffer QuotaExceeded → DecodeError 6003。）
-            try {
+            // 預載（別支影片）的回應不能動「正在播的片」的碼率清單與緩衝門檻
+            if (!isPreload) try {
                 const vids = (dash.video || [])
                 const auds = (dash.audio || [])
                 const maxV = vids.reduce((m, v) => Math.max(m, v.bandwidth || 0), 0)
@@ -2488,7 +2617,8 @@ const playInfoTransformer = (playInfo) => {
             sanitizePlayInfoUrls(dash)
 
             // 拿一條真實視訊 segment 當賽馬樣本（見 pickBakeoffSampleUrl：Akamai 為主時改從 backup 取）
-            try {
+            // 預載的回應不排測速、也不換樣本：那是別支影片的檔案，節點上有沒有快取跟正在播的片無關
+            if (!isPreload) try {
                 const sample = pickBakeoffSampleUrl(dash.video)
                 if (sample) {
                     // v1.3.5：給賽馬探測一個檔案大小的估計值（碼率 × 長度），讓它能量中後段（見 pickProbeOffset）。
@@ -2707,7 +2837,8 @@ const interceptNetResponse = (function (theWindow) {
                 const cdn  = this._redirectedCdn || this._originCdn
                 const self = this
                 const segStartedAt = Date.now()
-                const segToken = Watchdog.noteSegmentStart(cdn, this)
+                const foreign = isForeignSegment(this._interceptUrl)   // 別支片（懸停預覽）的片段：不餵給 Watchdog
+                const segToken = foreign ? 0 : Watchdog.noteSegmentStart(cdn, this)
                 this.addEventListener('loadend', () => Watchdog.noteSegmentEnd(segToken))
                 let firstByteAt = 0
                 let progressEvents = 0
@@ -2734,7 +2865,7 @@ const interceptNetResponse = (function (theWindow) {
                     const delta = loaded - lastProgressLoaded
                     if (delta > 0) {
                         lastProgressLoaded = loaded
-                        Watchdog.noteExternalBytes(cdn, delta)
+                        if (!foreign) Watchdog.noteExternalBytes(cdn, delta)
                         // 邊下載邊刷新去重標記（而不是只在下載完當下標一次）：
                         // 大 segment 下載期間，PerformanceObserver 的 resource-timing entry
                         // 理論上要等整包傳完才會送達，但送達時機沒有跟我們的量測同步保證，
@@ -2764,7 +2895,7 @@ const interceptNetResponse = (function (theWindow) {
                         // 相減會逼近 0ms，Math.max(1,...) 的下限反而把 Mbps 撐爆成離譜的天文數字。
                         // 這種情況退回含 TTFB 的完整耗時，寧可略為低估也不要產生失真的極端值。
                         const durationBase = progressEvents >= 2 ? (firstByteAt || segStartedAt) : segStartedAt
-                        noteSegmentBytes(cdn, self, durationBase, self._interceptUrl, lastProgressLoaded)
+                        noteSegmentBytes(cdn, self, durationBase, self._interceptUrl, lastProgressLoaded, foreign)
                     }
                 })
             }
@@ -2867,7 +2998,8 @@ const interceptNetResponse = (function (theWindow) {
                 : effectiveUrl
 
             const fetchStartedAt = Date.now()
-            const segToken = Watchdog.noteSegmentStart(targetCdn)
+            const foreign = isForeignSegment(effectiveUrl)   // 別支片（懸停預覽）的片段：不餵給 Watchdog
+            const segToken = foreign ? 0 : Watchdog.noteSegmentStart(targetCdn)
             let segEnded = false
             const endSeg = () => { if (!segEnded) { segEnded = true; Watchdog.noteSegmentEnd(segToken) } }
             return OriginalFetch(fetchInput, init).then(res => {
@@ -2895,7 +3027,7 @@ const interceptNetResponse = (function (theWindow) {
                                     if (!firstChunkAt) firstChunkAt = Date.now()   // 純傳輸時間起點，扣掉 TTFB
                                     chunkCount++
                                     counted += value.byteLength
-                                    Watchdog.noteExternalBytes(targetCdn, value.byteLength)
+                                    if (!foreign) Watchdog.noteExternalBytes(targetCdn, value.byteLength)
                                     // 邊讀邊刷新去重標記：PerformanceObserver 的 resource-timing entry
                                     // 到達時機跟我們這條逐 chunk 讀取的 tee 分支沒有嚴格順序保證，尤其
                                     // 大檔案/慢連線下這條路徑可能還沒讀完、entry 卻先送達，若只在 done
@@ -2925,7 +3057,7 @@ const interceptNetResponse = (function (theWindow) {
                             const cl = res.headers.get('content-length')
                             const bytes = cl ? (parseInt(cl, 10) || 0) : 0
                             if (bytes) {
-                                Watchdog.noteExternalBytes(targetCdn, bytes)
+                                if (!foreign) Watchdog.noteExternalBytes(targetCdn, bytes)
                                 notePassiveThroughput(targetCdn, bytes, Math.max(1, Date.now() - fetchStartedAt), latestPlaybackRate)
                                 noteSegmentAccounted(effectiveUrl)
                             }
@@ -3571,6 +3703,11 @@ const setLastBakeoffAt = (ts) => {
 }
 let bakeoffRunning       = false
 let bakeoffTimer         = null
+// 本分頁一次性旗標：換片、切畫質、fragment 錯誤、4K 卡頓、手動 BiliCDN.bakeoff() 時，
+// 只放行「這個分頁」立即測一次，不去動共用冷卻時間戳。
+// 舊版用 setLastBakeoffAt(0) 達成，但那個時間戳是全分頁共用的（見 BAKEOFF_TS_KEY），
+// 歸零會連帶解除其他每個分頁的冷卻，害它們接力把 N 場賽馬排隊跑完——正是本機制要消滅的浪費。
+let forceNextBakeoff     = false
 let lastSampleSegmentUrl = null
 let bakeoffNullStreak    = 0   // 連續幾輪賽馬「有候選但全部測速失敗」，用來偵測測速機制被防盜鏈整批擋下
 // SPA 換片時遞增；讓仍在跑/排程中的舊片賽馬盡快自我放棄，把頻寬讓給新片。
@@ -3740,8 +3877,11 @@ const runThroughputBakeoff = async (sampleUrl, skipIfFast = true, deferForStartu
     if (!sampleUrl || !isBiliVideoUrl(sampleUrl)) return
     // 綁定節點的串流換 host 必定 403，測了也拿不到任何有效樣本（見 hostLockedStreams）
     if (isHostLockedStream(sampleUrl)) return
-    // 冷卻改讀共用時間戳：別的分頁剛測過就不必再測一次（見 BAKEOFF_TS_KEY 說明）
-    if (Date.now() - getLastBakeoffAt() < THRPT_BAKEOFF_COOLDOWN) return
+    // 冷卻改讀共用時間戳：別的分頁剛測過就不必再測一次（見 BAKEOFF_TS_KEY 說明）。
+    // forceNextBakeoff：本分頁換片／切畫質時放行立即測一次，不影響其他分頁的冷卻。
+    // 要等下面「起播讓路」過了才清掉——換片／切畫質當下幾乎一定在補緩衝而讓路，
+    // 若在這裡就清，2 秒後的重試會撞上冷卻而無聲放棄（舊作法把共用時間戳歸零，重試時冷卻仍是解除的）。
+    if (!forceNextBakeoff && Date.now() - getLastBakeoffAt() < THRPT_BAKEOFF_COOLDOWN) return
 
     // ★ 起播保護：緩衝還沒到 STARTUP_MIN_BUFFER_SEC 就先讓路，每 2 秒再看一次。
     // 有上限（MAX_STARTUP_DEFERS）—— 否則遇到「怎麼都緩衝不起來」的爛節點時，
@@ -3758,6 +3898,8 @@ const runThroughputBakeoff = async (sampleUrl, skipIfFast = true, deferForStartu
         }
         return
     }
+    // 走到這裡就是「這次的強制放行已經被用來做決定」（跑、或判定夠快不必跑、或別的分頁正在測）
+    forceNextBakeoff = false
 
     // 現用節點剛好有新鮮的真實吞吐樣本、且遠高於這支片子實際需要的速度時，
     // 賽馬本身（連續打 1~4 顆候選、每顆最多 768KB）沒有急迫性，反而會在換片起播
@@ -3906,22 +4048,33 @@ const doBakeoff = async (sampleUrl, reason = '') => {
     }
 }
 
-const scheduleBakeoff = (sampleUrl, skipIfFast = true, deferForStartup = skipIfFast, reason = '') => {
+const MAX_SEEK_GRACE_RESCHEDULES = 3
+const scheduleBakeoff = (sampleUrl, skipIfFast = true, deferForStartup = skipIfFast, reason = '', seekRetries = 0) => {
     if (sampleUrl) lastSampleSegmentUrl = sampleUrl
     if (disabled || resolvedCdn || bakeoffTimer) return
     // 4K 開播當下最吃頻寬，測速會跟「初始緩衝」搶頻寬而拖慢起播 →
     // 4K 改為延後較久（先讓畫面開起來、緩衝拉起再測速）；一般畫質維持較短延遲。
     const highBitrate = currentStreamBitsPerSec / 1e6 >= 12
     const myEpoch = bakeoffEpoch
+    // 重排的那一次：等保護窗結束再多留一點，不沿用起播的延遲
+    const delay = seekRetries > 0 ? Math.max(500, seekGraceUntil - Date.now() + 300) : (highBitrate ? 4000 : 1500)
     bakeoffTimer = setTimeout(() => {
         bakeoffTimer = null
         // 換片會在 onSpaNavigate 主動清掉這個 timer，理論上不會用過期 epoch 觸發；
         // 這裡多一層防呆，避免任何遺漏路徑用舊片樣本跑掉這一輪賽馬名額。
         if (myEpoch !== bakeoffEpoch) return
+        // v1.4.2：seek 保護窗內不測速（不跟重新填充搶頻寬），但不能就這樣丟掉——runThroughputBakeoff
+        // 在窗內是無聲 return、沒有人會再排一次。2026-11-14 實機：合集／自動連播／有續播位置的換片，
+        // 載入後 0.5～1.4 秒播放器會跳到續播位置（seeking），開 5～8 秒的窗，起播測速（playurl 後
+        // 1.5～4 秒）正好落在窗內，整支片就不測速了。等窗結束再排；使用者一直拖時間軸就放棄（有上限）。
+        if (inSeekGrace() && seekRetries < MAX_SEEK_GRACE_RESCHEDULES) {
+            scheduleBakeoff(undefined, skipIfFast, deferForStartup, reason, seekRetries + 1)
+            return
+        }
         // 一律用當下最新樣本（而非排程當下 closure 住的那個），避免同一支片內
         // 中途換畫質/CDN 導致 sampleUrl 過期時仍打舊 URL。
         runThroughputBakeoff(lastSampleSegmentUrl, skipIfFast, deferForStartup, reason).catch(() => {})
-    }, highBitrate ? 4000 : 1500)
+    }, delay)
 }
 
 // v1.3.5：切到更高畫質後重新測速。
@@ -3944,7 +4097,7 @@ const maybeRunQualityUpBakeoff = () => {
     log('[Bakeoff] 畫質提高至約 ' + (qualityUpPendingBps / 1e6).toFixed(1) + ' Mbps，重新測速')
     qualityUpPendingBps = 0
     bakeoffStartupDefers = 0
-    setLastBakeoffAt(0)
+    forceNextBakeoff = true   // 只讓本分頁的切畫質重測立即放行，不清掉其他分頁的共用冷卻
     // v1.3.6：不跳過（skipIfFast=false）。v1.3.5 沿用「現用節點夠快就跳過」，結果使用者切了畫質卻什麼都沒發生，
     // 而且跳過是無聲的。使用者主動切畫質就是想要重新測速；代價有限：候選裡 60 秒內量過的節點本來就會被略過，
     // 每次最多 4 顆 × 384~768KB，同片同碼率只觸發一次。仍然起播讓路（新畫質正在補緩衝，別跟它搶頻寬）。
@@ -4006,7 +4159,7 @@ const installDashFragmentErrorHook = () => {
         promoteBestCdnNow()
         preconnectBatch(getHealthyCdnList().slice(0, 3), true)
         if (lastSampleSegmentUrl && currentStreamBitsPerSec / 1e6 >= 12) {
-            setLastBakeoffAt(0)
+            forceNextBakeoff = true   // 只放行本分頁這一次，不歸零共用時間戳（會連帶解除其他分頁的冷卻）
             // 已經真的出錯（fragment 下載失敗）才會走到這裡，不能被「現用節點目前還算快」擋掉。
             runThroughputBakeoff(lastSampleSegmentUrl, false).catch(() => {})
         }
@@ -4542,12 +4695,15 @@ const Watchdog = (() => {
         if (wasSegmentAccounted(entry.name)) return
         const bytes = entry.transferSize || entry.encodedBodySize || 0
         if (!bytes) return
-        totalBytes += bytes
-        phaseBytes += bytes
+        // 別支片（懸停預覽）的片段：不計入這支片的流量與「目前播放節點」，節點速度照記（見 isForeignSegment）
+        const foreign = isForeignSegment(entry.name)
+        if (!foreign) { totalBytes += bytes; phaseBytes += bytes }
         try {
             const h = new URL(entry.name).hostname
-            lastSegmentCdn = h
-            perCdnBytes[h] = (perCdnBytes[h] || 0) + bytes
+            if (!foreign) {
+                lastSegmentCdn = h
+                perCdnBytes[h] = (perCdnBytes[h] || 0) + bytes
+            }
             // 用最新觀察到的播放倍速計算 required Mbps，避免倍速下少抓 slow
             const v = getVideo()
             const rate = v && v.playbackRate ? v.playbackRate : latestPlaybackRate
@@ -4707,7 +4863,7 @@ const Watchdog = (() => {
         // 4K：卡頓多半是節點速度不夠，立刻實測各節點下載速度，確保切到真的夠快的節點
         // Watchdog 已經判定停滯才會走到這裡，不能被「現用節點目前還算快」的捷徑擋掉。
         if (currentStreamBitsPerSec / 1e6 >= 12 && lastSampleSegmentUrl) {
-            setLastBakeoffAt(0)
+            forceNextBakeoff = true   // 只放行本分頁這一次，不歸零共用時間戳（會連帶解除其他分頁的冷卻）
             runThroughputBakeoff(lastSampleSegmentUrl, false).catch(() => {})
         }
         // 不 nudge currentTime：跟 bili player 內建 Stuck:Rescue 搶會 buffer 抖動
@@ -5032,8 +5188,13 @@ const Watchdog = (() => {
 
 // 頁面型態（改進工單 F 用）：只取路徑的類別區段（video/bangumi/play/cheese...），
 // 不含 BV 號、ep 號等具體影片識別碼。
+// 換片是被哪個訊號判定的、略過了幾次預載（v1.4.2）。「無網址變動」不為 0 就是異常，見 videoResetStats 的說明。
+const formatVideoResetStats = () => '網址 ' + videoResetStats.byUrl + '｜playurl ' + videoResetStats.byPlayurl + '｜互相認領 ' + videoResetStats.claimed + '｜無網址變動 ' + videoResetStats.orphan + '｜略過預載 ' + videoResetStats.preloadSeen
+    + '｜排除預覽片段 ' + videoResetStats.foreignSegs + (videoResetStats.filterDisarmed ? '｜⚠ 過濾解除 ' + videoResetStats.filterDisarmed : '')
 const getPageTypeLabel = () => {
-    const path = location.pathname
+    // 去掉語系前綴（/zh-Hant/video/... -> /video/...），否則類別會被誤判成 /zh 或 /en
+    // 不寫死語系清單（跟 @match 的萬用寫法一致）：只要後面接的是有語系版的頁型就剝掉
+    const path = location.pathname.replace(/^\/[a-z]{2}(?:-[A-Za-z]{2,4})?(?=\/(?:video|list|watchlater)\/)/, '')
     const m = path.match(/^\/([a-z]+)(?:\/([a-z]+))?/)
     if (!m) return path || '/'
     return '/' + [m[1], m[2]].filter(Boolean).join('/')
@@ -5048,6 +5209,7 @@ const buildDiagReport = () => {
         '[BiliCDN_TW 診斷報告]',
         '版本：' + VERSION,
         '頁面型態：' + getPageTypeLabel(),
+        '換片判定：' + formatVideoResetStats(),
         'UA：' + navigator.userAgent,
         '面板注入狀態：' + uiInjectStatus,
         '停用狀態：' + disabled,
@@ -5167,6 +5329,7 @@ unsafeWindow.BiliCDN = {
             : uiInjectStatus === 'timeout' ? '⚠ 找不到設定面板錨點（可能 Bilibili 改版，CDN 改寫不受影響仍照常運作）'
             : '等待播放器載入中')
         console.log('頁面發現 CDN:', pageDiscoveredCdn ? pageDiscoveredCdn.split('.')[0] : '（無）')
+        console.log('換片判定:', formatVideoResetStats())
         console.log('HTTPDNS:', getHttpDnsStatus())
         console.log('WebRTC 阻擋:', BlockWebRTC)
         console.log('改寫統計:', { ...redirectStats })
@@ -5214,7 +5377,7 @@ unsafeWindow.BiliCDN = {
             console.log('[BiliCDN] 尚無 segment 樣本，請先播放影片數秒再試')
             return
         }
-        setLastBakeoffAt(0)
+        forceNextBakeoff = true   // 只放行本分頁這一次，不歸零共用時間戳（會連帶解除其他分頁的冷卻）
         console.log('[BiliCDN] 開始吞吐量賽馬…（約 1~5 秒）')
         // 使用者手動要求的，不能被「現用節點目前還算快」的捷徑靜默跳過。
         return runThroughputBakeoff(lastSampleSegmentUrl, false).then(() => {
@@ -5505,7 +5668,7 @@ if (typeof GM_registerMenuCommand === 'function') {
             // 也就是說走這條路徑的 playurl **從來沒有被改寫過**，而且完全無聲無息。
             const isObj = typeof response === 'object'
             const playInfo = isObj ? response : JSON.parse(response)
-            playInfoTransformer(playInfo)
+            playInfoTransformer(playInfo, { preload: isPreloadPlayUrl(url) })
             // 物件是就地改寫，回傳同一個參考即可；字串才需要重新序列化。
             return isObj ? playInfo : JSON.stringify(playInfo)
         } catch (e) { err('playurl parse error:', e) }
@@ -5767,8 +5930,10 @@ if (typeof GM_registerMenuCommand === 'function') {
         // v1.3.3：多 P 影片切換分集只會改 ?p=，pathname 一個字都不變 —— 不納入的話
         // 換分集不算換片，新分集會整包沿用上一集的碼率、賽馬冷卻與 Watchdog 狀態
         // （長片合集、課程、紀錄片這類多 P 內容最容易中）。
+        // v1.4.2：?p=1 跟「沒有 p」是同一集（第一集），不能算成兩個 key——否則網址被補上或拿掉
+        // ?p=1 的當下會被當成換片，把還在播的這一集的狀態整包重置。
         const part = sp.get('p') || ''
-        return part ? base + '#p' + part : base
+        return (part && part !== '1') ? base + '#p' + part : base
     }
     // v1.3.4（改進 D-1）：把「認不出這是哪部片」這件事從靜默失敗改成會出聲。
     // 過去兩種來源都落空時會安靜退回 location.pathname —— 看起來很合理，實際上
@@ -5783,6 +5948,14 @@ if (typeof GM_registerMenuCommand === 'function') {
     //      不是故障，不需要讓一般使用者緊張。
     // 這一則涵蓋的是「@match 有涵蓋、但網址型態不認得」的情況；
     // 「@match 根本沒涵蓋」的新頁型腳本不會被載入，偵測不到，只能靠使用者回報。
+    // 實例（2026-11-14 實測）：未登入、且沒有 user_site=CN cookie 的訪客，首頁 www.bilibili.com/ 會依
+    // lang cookie／Accept-Language 302 到語系首頁
+    // （zh-TW/zh-HK -> /zh-Hant、zh/zh-CN/沒帶 -> /zh-Hans、en -> /en、ja -> /ja），語系首頁上的
+    // 影片連結全都帶前綴（/zh-Hant/video/BV…），舊版 @match 只寫 /video/*，腳本整個沒載入、也沒有
+    // 任何錯誤訊息。直接開無前綴網址不會被導走。有語系版的只有 video、list、watchlater 三種頁型；
+    // bangumi 帶前綴會 308 回無前綴網址，其餘頁型帶前綴是 404，所以只對這三種加語系 @match。
+    // 語系段用萬用字元（/*/video/*），B 站日後新增語系（目前 ko、zh-TW 等是 404）不必改腳本；
+    // 新增「有語系版的頁型」時才要補 @match，並同步 getPageTypeLabel 的頁型清單。
     let videoKeyFallbackWarned = false
     const warnIfVideoKeyUnresolvable = () => {
         if (!videoKeyUsedFallback || videoKeyFallbackWarned) return
@@ -5793,19 +5966,17 @@ if (typeof GM_registerMenuCommand === 'function') {
             + '若換片後感覺變卡，請把這個網址型態回報給作者。')
     }
     let currentVideoKey = getVideoKey()
+    let currentKeyWasFallback = videoKeyUsedFallback   // 目前的 key 是不是「認不出影片、退回 pathname」得來的
+    let currentKeyPath = location.pathname
     let spaHooked = false
-    const onSpaNavigate = () => {
-        const key = getVideoKey()
-        // v1.3.4：一定要放在下面的 early return 之前——「認不出影片」的症狀正是
-        // key 一直不變、每次都從那一行 return 掉，放在後面等於永遠不會執行。
-        warnIfVideoKeyUnresolvable()
-        if (key === currentVideoKey) return
-        currentVideoKey = key
+    // 換片時的重置本體。兩個來源會叫它：網址變動（onSpaNavigate）與主 playurl 的 cid 變動（noteMainStream），
+    // 同一次換片由先到的那個執行、後到的認領（見「影片身分」那段說明）。
+    const resetForNewVideo = (why) => {
         forcedRedirectHosts.clear()
         akamaiHostSeen.clear()      // 舊片的 Akamai 殘留跟新片無關，不用留著繼續 keep-warm
         resetStreamProfile()        // v1.3.3：舊片碼率不能留給新片（見該函式說明）
         bakeoffStartupDefers = 0    // v1.3.3：新片重新給滿起播讓路的額度
-        setLastBakeoffAt(0)           // 解除冷卻，新片可立即賽馬
+        forceNextBakeoff = true       // 解除「本分頁」冷卻，新片可立即賽馬（不動共用時間戳，不波及其他分頁）
         lastSampleSegmentUrl = null
         // 放棄舊片還沒發出/還在跑的賽馬，把名額讓給新片：
         // - 還沒發出（排程中）：epoch 不符，scheduleBakeoff 的 timeout 觸發時直接跳過。
@@ -5817,7 +5988,56 @@ if (typeof GM_registerMenuCommand === 'function') {
         try { Watchdog.reset() } catch {}
         try { HttpDnsAutoPilot.onWatchdogReset() } catch {}
         if (rearmSeekPrewarm) rearmSeekPrewarm()
-        log('[SPA] 換片：' + key + '，重置選節點狀態')
+        log('[SPA] 換片：' + why + '，重置選節點狀態')
+    }
+    // 自我檢查（理由同 warnIfVideoKeyUnresolvable：要靠它主動現身，不受 Config.verbose 控制）。
+    // 認不出影片的頁面（網址本來就不會跟著換片變）不算異常——那種頁面正是靠 playurl 這條路在撐。
+    let orphanResetWarned = false
+    newVideoResetHook = (why) => {
+        resetForNewVideo(why)
+        const mine = playurlResetAt
+        setTimeout(() => {
+            if (!playurlResetUnclaimed || playurlResetAt !== mine || videoKeyUsedFallback) return
+            playurlResetUnclaimed = false
+            videoResetStats.orphan++
+            if (orphanResetWarned) return
+            orphanResetWarned = true
+            console.warn('[' + PluginName + ']: 偵測到「播放資訊換成另一支影片、網址卻沒有變」。可能是 B 站預先載入'
+                + '別支影片的方式改了，腳本把它誤認成換片——測速與卡頓判定可能在播放途中被重置。'
+                + '影片仍會正常播放；若覺得變卡，請把 BiliCDN.diag() 的「換片判定」那一行回報給作者。')
+        }, VIDEO_RESET_PAIR_MS + 500)
+    }
+    const onSpaNavigate = () => {
+        const prevWasFallback = currentKeyWasFallback, prevPath = currentKeyPath
+        const key = getVideoKey()
+        // v1.3.4：一定要放在下面的 early return 之前——「認不出影片」的症狀正是
+        // key 一直不變、每次都從那一行 return 掉，放在後面等於永遠不會執行。
+        warnIfVideoKeyUnresolvable()
+        if (key === currentVideoKey) return
+        currentVideoKey = key
+        currentKeyWasFallback = videoKeyUsedFallback
+        currentKeyPath = location.pathname
+        // v1.4.2：同一個頁面上「原本認不出影片 → 現在認得了」不是換片，是 B 站晚一步才把 ?bvid= 補上網址
+        // （/list/watchlater 剛載入時就是這樣）。當成換片會把第一支片剛拿到的測速樣本清掉。
+        if (prevWasFallback && !videoKeyUsedFallback && location.pathname === prevPath) {
+            log('[SPA] 網址補上影片識別碼：' + key + '（同一支片，不重置）')
+            return
+        }
+        // 主 playurl 已經先到、並且為這支新片重置過了（合集清單／分 P／自動連播的順序）：認領，不再重置一次
+        if (playurlResetUnclaimed && Date.now() - playurlResetAt < VIDEO_RESET_PAIR_MS) {
+            playurlResetUnclaimed = false
+            videoResetStats.claimed++
+            log('[SPA] 網址跟上：' + key + '（已由 playurl 重置過）')
+            return
+        }
+        urlResetAt = Date.now()
+        urlResetPending = true
+        videoResetStats.byUrl++
+        // 新片的主 playurl 還沒到，這段時間不知道主影片的 cid：清空＝暫時不過濾片段（見 isForeignSegment）。
+        // 留著舊的 cid 的話，新片若走不帶 cid 判定的路徑（非 dash），它的片段會全被當成別支片。
+        if (mainStreamCid) cidBeforeUrlReset = mainStreamCid
+        mainStreamCid = ''
+        resetForNewVideo(key)
     }
     const hookHistory = () => {
         if (spaHooked) return
@@ -5839,6 +6059,7 @@ if (typeof GM_registerMenuCommand === 'function') {
 
     let runtimeStarted = false
     let keepWarmTimer = null
+    let foreignCheckTimer = null
     let periodicBakeoffTimer = null
     const startRuntimeFeatures = () => {
         if (runtimeStarted || disabled) return
@@ -5855,6 +6076,7 @@ if (typeof GM_registerMenuCommand === 'function') {
             discoverCdnFromPage()
         }
         setupSeekPrewarm()
+        if (!foreignCheckTimer) foreignCheckTimer = setInterval(checkForeignFilterSanity, FOREIGN_FILTER_CHECK_MS)
         // Keep-warm：瀏覽器 idle connection 約 30s 斷，搶在斷前刷新 Top 3 + Akamai
         if (!keepWarmTimer) {
             keepWarmTimer = setInterval(() => {
@@ -5883,6 +6105,10 @@ if (typeof GM_registerMenuCommand === 'function') {
         if (keepWarmTimer) {
             clearInterval(keepWarmTimer)
             keepWarmTimer = null
+        }
+        if (foreignCheckTimer) {
+            clearInterval(foreignCheckTimer)
+            foreignCheckTimer = null
         }
         if (periodicBakeoffTimer) {
             clearInterval(periodicBakeoffTimer)
